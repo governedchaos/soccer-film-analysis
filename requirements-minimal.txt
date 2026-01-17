@@ -1,0 +1,33 @@
+# Soccer Film Analysis - Minimal Requirements for Claude Code / Headless Testing
+# This is a subset for testing detection without GUI
+# Use requirements.txt for full installation
+
+# Core Detection & Tracking
+ultralytics>=8.3.0
+supervision>=0.25.0
+
+# Computer Vision & Video Processing
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Machine Learning
+scikit-learn>=1.3.0
+
+# Database (SQLite support - no PostgreSQL needed for testing)
+sqlalchemy>=2.0.0
+
+# Configuration
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Logging
+loguru>=0.7.0
+
+# CLI
+rich>=13.7.0
+
+# Note: PyTorch will be installed by ultralytics automatically
+# For CUDA support, install separately:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
