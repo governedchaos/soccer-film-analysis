@@ -294,18 +294,27 @@ class VideoProcessor:
                     logger.warning(f"Failed to read frame {frame_num}")
                     continue
                 
-                # Run detection
-                detections = self.detector.detect_frame(
-                    frame, frame_num, self.video_info.fps,
-                    detect_pitch=True, track_objects=True
-                )
-                
-                # Classify teams
-                self.team_classifier.classify_players(detections.players)
-                self.team_classifier.classify_players(detections.goalkeepers)
-                
-                # Store detections
-                self.frame_detections[frame_num] = detections
+                # Run detection with error handling
+                try:
+                    detections = self.detector.detect_frame(
+                        frame, frame_num, self.video_info.fps,
+                        detect_pitch=True, track_objects=True
+                    )
+
+                    # Classify teams
+                    self.team_classifier.classify_players(detections.players)
+                    self.team_classifier.classify_players(detections.goalkeepers)
+
+                    # Store detections
+                    self.frame_detections[frame_num] = detections
+                except Exception as detection_error:
+                    logger.warning(f"Detection failed on frame {frame_num}: {detection_error}")
+                    # Create empty detections to continue
+                    detections = FrameDetections(
+                        frame_number=frame_num,
+                        timestamp_seconds=frame_num / self.video_info.fps
+                    )
+                    self.frame_detections[frame_num] = detections
                 
                 # Save to database
                 if save_to_db and session_id:

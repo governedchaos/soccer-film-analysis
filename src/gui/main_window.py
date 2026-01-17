@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QTabWidget, QTextEdit, QSpinBox, QDoubleSpinBox, QCheckBox,
     QFrame, QSizePolicy, QStyle
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QSize
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QSize, QMetaObject, Q_ARG
 from PyQt6.QtGui import QImage, QPixmap, QAction, QPalette, QColor
 
 import cv2
@@ -25,6 +25,42 @@ from loguru import logger
 from config import settings, AnalysisDepth
 from src.core.video_processor import ThreadedVideoProcessor, VideoInfo, AnalysisProgress
 from src.detection.detector import FrameDetections
+
+
+class LogPanel(QTextEdit):
+    """
+    Panel displaying real-time log messages for debugging.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setMaximumHeight(150)
+        self.setStyleSheet("""
+            QTextEdit {
+                background-color: #1a1a1a;
+                color: #00ff00;
+                font-family: Consolas, monospace;
+                font-size: 11px;
+                border: 1px solid #333;
+            }
+        """)
+        self.setPlaceholderText("Log messages will appear here...")
+
+    def log(self, message: str, level: str = "INFO"):
+        """Add a log message with timestamp"""
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        color = {
+            "DEBUG": "#888888",
+            "INFO": "#00ff00",
+            "WARNING": "#ffaa00",
+            "ERROR": "#ff4444"
+        }.get(level, "#ffffff")
+        self.append(f'<span style="color: {color}">[{timestamp}] [{level}] {message}</span>')
+        # Auto-scroll to bottom
+        scrollbar = self.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
 
 class VideoWidget(QLabel):
@@ -292,7 +328,12 @@ class MainWindow(QMainWindow):
     """
     Main application window.
     """
-    
+
+    # Signals for thread-safe GUI updates
+    frame_ready = pyqtSignal(np.ndarray, object)  # frame, detections
+    progress_ready = pyqtSignal(object)  # AnalysisProgress
+    analysis_complete = pyqtSignal(dict)  # result dict
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Soccer Film Analysis")
@@ -332,10 +373,19 @@ class MainWindow(QMainWindow):
         # Video widget
         self.video_widget = VideoWidget()
         left_layout.addWidget(self.video_widget, stretch=1)
-        
+
         # Control panel
         self.control_panel = ControlPanel()
         left_layout.addWidget(self.control_panel)
+
+        # Debug log panel (collapsible)
+        self.log_panel = LogPanel()
+        self.log_toggle_btn = QPushButton("Show Debug Log")
+        self.log_toggle_btn.setCheckable(True)
+        self.log_toggle_btn.clicked.connect(self._toggle_log_panel)
+        self.log_panel.setVisible(False)
+        left_layout.addWidget(self.log_toggle_btn)
+        left_layout.addWidget(self.log_panel)
         
         # Right side - Stats and info
         right_widget = QWidget()
@@ -457,6 +507,55 @@ class MainWindow(QMainWindow):
         self.control_panel.seek_frame.connect(self.seek_frame)
         self.control_panel.analysis_started.connect(self.start_analysis)
         self.control_panel.analysis_stopped.connect(self.stop_analysis)
+
+        # Connect thread-safe signals for analysis updates
+        self.frame_ready.connect(self._on_frame_ready)
+        self.progress_ready.connect(self._on_progress_ready)
+        self.analysis_complete.connect(self._on_analysis_complete)
+
+    def _on_frame_ready(self, frame: np.ndarray, detections):
+        """Handle frame ready signal (runs in main thread)"""
+        self.video_widget.display_frame(frame)
+        fps = self.video_info.fps if self.video_info else 30
+        self.stats_panel.update_stats(detections.frame_number, fps, detections)
+        # Log detection counts periodically
+        if detections.frame_number % 50 == 0:
+            player_count = len(detections.players)
+            ball_detected = "Yes" if detections.ball else "No"
+            self.log_message(
+                f"Frame {detections.frame_number}: {player_count} players, ball: {ball_detected}",
+                "DEBUG"
+            )
+
+    def _on_progress_ready(self, progress):
+        """Handle progress update signal (runs in main thread)"""
+        self.control_panel.update_progress(progress)
+        # Log every 100 frames
+        if progress.current_frame % 100 == 0:
+            self.log_message(
+                f"Frame {progress.current_frame}/{progress.total_frames} "
+                f"({progress.percentage:.1f}%) - {progress.frames_per_second:.1f} FPS",
+                "DEBUG"
+            )
+
+    def _on_analysis_complete(self, result: dict):
+        """Handle analysis complete signal (runs in main thread)"""
+        self.control_panel.set_analyzing(False)
+        if result.get("status") == "completed":
+            msg = f"Analysis complete! {result.get('processed_frames', 0)} frames in {result.get('elapsed_seconds', 0)/60:.1f} min"
+            self.status_bar.showMessage(msg)
+            self.log_message(msg, "INFO")
+            self.export_btn.setEnabled(True)
+            QMessageBox.information(
+                self, "Analysis Complete",
+                f"Analysis finished successfully!\n"
+                f"Processed {result.get('processed_frames', 0)} frames in "
+                f"{result.get('elapsed_seconds', 0)/60:.1f} minutes."
+            )
+        else:
+            error_msg = result.get('error', 'Unknown error')
+            self.status_bar.showMessage(f"Analysis failed: {error_msg}")
+            self.log_message(f"Analysis failed: {error_msg}", "ERROR")
     
     def load_video(self):
         """Open file dialog and load video"""
@@ -471,12 +570,13 @@ class MainWindow(QMainWindow):
             return
         
         try:
+            self.log_message(f"Loading video: {file_path}", "INFO")
             self.video_info = self.processor.load_video(file_path)
-            
+
             # Update UI
             self.control_panel.set_frame_range(self.video_info.total_frames)
             self.control_panel.update_frame_label(0, self.video_info.total_frames)
-            
+
             info_text = (
                 f"<b>{self.video_info.path.name}</b><br>"
                 f"Resolution: {self.video_info.width}x{self.video_info.height}<br>"
@@ -485,20 +585,32 @@ class MainWindow(QMainWindow):
                 f"Frames: {self.video_info.total_frames:,}"
             )
             self.video_info_label.setText(info_text)
-            
+
+            self.log_message(
+                f"Video info: {self.video_info.width}x{self.video_info.height}, "
+                f"{self.video_info.fps:.1f} FPS, {self.video_info.total_frames} frames",
+                "INFO"
+            )
+
             # Show first frame
             self.show_frame(0)
-            
+
             self.status_bar.showMessage(f"Loaded: {self.video_info.path.name}")
             logger.info(f"Video loaded: {file_path}")
-            
+
             # Auto-calibrate team colors
             self.status_bar.showMessage("Calibrating team colors...")
-            self.processor.calibrate_teams()
-            self.status_bar.showMessage(f"Loaded: {self.video_info.path.name} (calibrated)")
-            
+            self.log_message("Calibrating team colors from sample frames...", "INFO")
+            try:
+                self.processor.calibrate_teams()
+                self.log_message("Team color calibration complete", "INFO")
+            except Exception as cal_error:
+                self.log_message(f"Calibration warning: {cal_error}", "WARNING")
+            self.status_bar.showMessage(f"Loaded: {self.video_info.path.name} (ready)")
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load video:\n{str(e)}")
+            self.log_message(f"Failed to load video: {e}", "ERROR")
             logger.error(f"Failed to load video: {e}")
     
     def show_frame(self, frame_number: int):
@@ -565,42 +677,34 @@ class MainWindow(QMainWindow):
         if self.video_info is None:
             QMessageBox.warning(self, "No Video", "Please load a video first.")
             return
-        
+
         depth_enum = AnalysisDepth(depth)
-        
+
         self.control_panel.set_analyzing(True)
         self.status_bar.showMessage("Analysis in progress...")
-        
+        self.log_message(f"Starting {depth} analysis on {self.video_info.path.name}", "INFO")
+
+        # Use signals for thread-safe GUI updates
         def on_progress(progress: AnalysisProgress):
-            self.control_panel.update_progress(progress)
-        
+            self.progress_ready.emit(progress)
+
         def on_frame(frame: np.ndarray, detections: FrameDetections):
-            self.video_widget.display_frame(frame)
-            fps = self.video_info.fps if self.video_info else 30
-            self.stats_panel.update_stats(detections.frame_number, fps, detections)
-        
+            self.frame_ready.emit(frame, detections)
+
         def on_complete(result: dict):
+            self.analysis_complete.emit(result)
+
+        try:
+            self.processor.process_video_async(
+                analysis_depth=depth_enum,
+                progress_callback=on_progress,
+                frame_callback=on_frame,
+                completion_callback=on_complete
+            )
+        except Exception as e:
+            self.log_message(f"Failed to start analysis: {e}", "ERROR")
             self.control_panel.set_analyzing(False)
-            if result.get("status") == "completed":
-                self.status_bar.showMessage(
-                    f"Analysis complete! {result.get('processed_frames', 0)} frames processed."
-                )
-                self.export_btn.setEnabled(True)
-                QMessageBox.information(
-                    self, "Analysis Complete",
-                    f"Analysis finished successfully!\n"
-                    f"Processed {result.get('processed_frames', 0)} frames in "
-                    f"{result.get('elapsed_seconds', 0)/60:.1f} minutes."
-                )
-            else:
-                self.status_bar.showMessage(f"Analysis failed: {result.get('error', 'Unknown error')}")
-        
-        self.processor.process_video_async(
-            analysis_depth=depth_enum,
-            progress_callback=on_progress,
-            frame_callback=on_frame,
-            completion_callback=on_complete
-        )
+            QMessageBox.critical(self, "Error", f"Failed to start analysis:\n{str(e)}")
     
     def stop_analysis(self):
         """Stop current analysis"""
@@ -608,6 +712,15 @@ class MainWindow(QMainWindow):
         self.control_panel.set_analyzing(False)
         self.status_bar.showMessage("Analysis stopped")
     
+    def _toggle_log_panel(self, checked: bool):
+        """Toggle the debug log panel visibility"""
+        self.log_panel.setVisible(checked)
+        self.log_toggle_btn.setText("Hide Debug Log" if checked else "Show Debug Log")
+
+    def log_message(self, message: str, level: str = "INFO"):
+        """Add message to log panel"""
+        self.log_panel.log(message, level)
+
     def show_about(self):
         """Show about dialog"""
         QMessageBox.about(
@@ -653,7 +766,7 @@ def apply_dark_theme(app: QApplication):
     
     app.setPalette(palette)
     
-    # Additional stylesheet
+    # Additional stylesheet with improved contrast
     app.setStyleSheet("""
         QGroupBox {
             border: 1px solid #555;
@@ -661,16 +774,41 @@ def apply_dark_theme(app: QApplication):
             margin-top: 10px;
             padding-top: 10px;
             font-weight: bold;
+            color: #ffffff;
         }
         QGroupBox::title {
             subcontrol-origin: margin;
             left: 10px;
             padding: 0 5px;
+            color: #ffffff;
+        }
+        QLabel {
+            color: #ffffff;
+        }
+        QPushButton {
+            background-color: #555555;
+            color: #ffffff;
+            border: 1px solid #666;
+            border-radius: 4px;
+            padding: 6px 12px;
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: #666666;
+        }
+        QPushButton:pressed {
+            background-color: #444444;
+        }
+        QPushButton:disabled {
+            background-color: #3a3a3a;
+            color: #888888;
         }
         QProgressBar {
             border: 1px solid #555;
             border-radius: 4px;
             text-align: center;
+            color: #ffffff;
+            background-color: #333;
         }
         QProgressBar::chunk {
             background-color: #4CAF50;
@@ -694,6 +832,46 @@ def apply_dark_theme(app: QApplication):
             border-radius: 4px;
             padding: 5px;
             min-width: 100px;
+            background-color: #444;
+            color: #ffffff;
+        }
+        QComboBox::drop-down {
+            border: none;
+            background-color: #555;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #444;
+            color: #ffffff;
+            selection-background-color: #4CAF50;
+        }
+        QMenuBar {
+            background-color: #353535;
+            color: #ffffff;
+        }
+        QMenuBar::item:selected {
+            background-color: #4CAF50;
+        }
+        QMenu {
+            background-color: #353535;
+            color: #ffffff;
+            border: 1px solid #555;
+        }
+        QMenu::item:selected {
+            background-color: #4CAF50;
+        }
+        QStatusBar {
+            background-color: #2a2a2a;
+            color: #ffffff;
+        }
+        QMessageBox {
+            background-color: #353535;
+            color: #ffffff;
+        }
+        QMessageBox QLabel {
+            color: #ffffff;
+        }
+        QMessageBox QPushButton {
+            min-width: 80px;
         }
     """)
 
