@@ -13,7 +13,8 @@ from PyQt6.QtWidgets import (
     QSplitter, QPushButton, QLabel, QSlider, QFileDialog, QComboBox,
     QProgressBar, QGroupBox, QGridLayout, QStatusBar, QMessageBox,
     QTabWidget, QTextEdit, QSpinBox, QDoubleSpinBox, QCheckBox,
-    QFrame, QSizePolicy, QStyle
+    QFrame, QSizePolicy, QStyle, QDialog, QLineEdit, QColorDialog,
+    QFormLayout, QDialogButtonBox, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QSize, QMetaObject, Q_ARG
 from PyQt6.QtGui import QImage, QPixmap, QAction, QPalette, QColor
@@ -25,6 +26,268 @@ from loguru import logger
 from config import settings, AnalysisDepth
 from src.core.video_processor import ThreadedVideoProcessor, VideoInfo, AnalysisProgress
 from src.detection.detector import FrameDetections
+
+
+class ColorButton(QPushButton):
+    """Button that shows and allows picking a color"""
+
+    color_changed = pyqtSignal(tuple)  # RGB tuple
+
+    def __init__(self, color=(255, 255, 255), parent=None):
+        super().__init__(parent)
+        self._color = color
+        self.setFixedSize(60, 30)
+        self.clicked.connect(self._pick_color)
+        self._update_style()
+
+    def _update_style(self):
+        r, g, b = self._color
+        # Determine text color based on brightness
+        brightness = (r * 299 + g * 587 + b * 114) / 1000
+        text_color = "#000000" if brightness > 128 else "#ffffff"
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background-color: rgb({r}, {g}, {b});
+                color: {text_color};
+                border: 2px solid #555;
+                border-radius: 4px;
+                font-weight: bold;
+            }}
+        """)
+        self.setText(f"#{r:02x}{g:02x}{b:02x}")
+
+    def _pick_color(self):
+        color = QColorDialog.getColor(QColor(*self._color), self, "Select Color")
+        if color.isValid():
+            self._color = (color.red(), color.green(), color.blue())
+            self._update_style()
+            self.color_changed.emit(self._color)
+
+    def get_color(self):
+        return self._color
+
+    def set_color(self, color):
+        self._color = color
+        self._update_style()
+
+
+class GameConfigDialog(QDialog):
+    """
+    Dialog for configuring game metadata, team colors, and field settings.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Game Configuration")
+        self.setMinimumWidth(500)
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Create scroll area for all settings
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+
+        # === GAME INFO ===
+        game_group = QGroupBox("Game Information")
+        game_layout = QFormLayout()
+
+        self.home_team_name = QLineEdit()
+        self.home_team_name.setPlaceholderText("e.g., La Follette High School")
+        game_layout.addRow("Home Team:", self.home_team_name)
+
+        self.away_team_name = QLineEdit()
+        self.away_team_name.setPlaceholderText("e.g., Madison East High School")
+        game_layout.addRow("Away Team:", self.away_team_name)
+
+        self.competition = QLineEdit()
+        self.competition.setPlaceholderText("e.g., Conference Championship")
+        game_layout.addRow("Competition:", self.competition)
+
+        self.venue = QLineEdit()
+        self.venue.setPlaceholderText("e.g., Breese Stevens Field")
+        game_layout.addRow("Venue:", self.venue)
+
+        game_group.setLayout(game_layout)
+        scroll_layout.addWidget(game_group)
+
+        # === TEAM COLORS ===
+        colors_group = QGroupBox("Team Colors (for player identification)")
+        colors_layout = QGridLayout()
+
+        colors_layout.addWidget(QLabel("Home Team:"), 0, 0)
+        self.home_primary_color = ColorButton((255, 215, 0))  # Gold
+        colors_layout.addWidget(QLabel("Primary"), 0, 1)
+        colors_layout.addWidget(self.home_primary_color, 0, 2)
+        self.home_secondary_color = ColorButton((0, 0, 0))  # Black
+        colors_layout.addWidget(QLabel("Secondary"), 0, 3)
+        colors_layout.addWidget(self.home_secondary_color, 0, 4)
+
+        colors_layout.addWidget(QLabel("Away Team:"), 1, 0)
+        self.away_primary_color = ColorButton((255, 0, 0))  # Red
+        colors_layout.addWidget(QLabel("Primary"), 1, 1)
+        colors_layout.addWidget(self.away_primary_color, 1, 2)
+        self.away_secondary_color = ColorButton((255, 255, 255))  # White
+        colors_layout.addWidget(QLabel("Secondary"), 1, 3)
+        colors_layout.addWidget(self.away_secondary_color, 1, 4)
+
+        colors_layout.addWidget(QLabel("Home GK:"), 2, 0)
+        self.home_gk_color = ColorButton((0, 255, 0))  # Green
+        colors_layout.addWidget(self.home_gk_color, 2, 2)
+
+        colors_layout.addWidget(QLabel("Away GK:"), 3, 0)
+        self.away_gk_color = ColorButton((255, 165, 0))  # Orange
+        colors_layout.addWidget(self.away_gk_color, 3, 2)
+
+        colors_layout.addWidget(QLabel("Referees:"), 4, 0)
+        self.referee_color = ColorButton((0, 0, 0))  # Black
+        colors_layout.addWidget(self.referee_color, 4, 2)
+
+        colors_group.setLayout(colors_layout)
+        scroll_layout.addWidget(colors_group)
+
+        # === FIELD SETTINGS ===
+        field_group = QGroupBox("Field Settings")
+        field_layout = QFormLayout()
+
+        self.field_type = QComboBox()
+        self.field_type.addItems(["Soccer-only field (white lines)",
+                                   "Multi-sport field (colored lines)",
+                                   "Custom"])
+        self.field_type.currentIndexChanged.connect(self._on_field_type_changed)
+        field_layout.addRow("Field Type:", self.field_type)
+
+        # Line colors
+        line_colors_widget = QWidget()
+        line_colors_layout = QHBoxLayout(line_colors_widget)
+        line_colors_layout.setContentsMargins(0, 0, 0, 0)
+
+        line_colors_layout.addWidget(QLabel("Soccer lines:"))
+        self.soccer_line_color = ColorButton((255, 255, 255))  # White
+        line_colors_layout.addWidget(self.soccer_line_color)
+
+        line_colors_layout.addWidget(QLabel("Other lines:"))
+        self.other_line_color = ColorButton((255, 255, 0))  # Yellow
+        line_colors_layout.addWidget(self.other_line_color)
+
+        line_colors_layout.addStretch()
+        field_layout.addRow("Line Colors:", line_colors_widget)
+
+        field_group.setLayout(field_layout)
+        scroll_layout.addWidget(field_group)
+
+        # === BALL SETTINGS ===
+        ball_group = QGroupBox("Ball Identification")
+        ball_layout = QFormLayout()
+
+        self.ball_type = QComboBox()
+        self.ball_type.addItems(["Standard white/black",
+                                  "High-visibility (yellow/orange)",
+                                  "Custom color"])
+        ball_layout.addRow("Ball Type:", self.ball_type)
+
+        self.ball_color = ColorButton((255, 255, 255))
+        ball_layout.addRow("Ball Color:", self.ball_color)
+
+        self.exclude_ballboys = QCheckBox("Exclude ball boys from tracking")
+        self.exclude_ballboys.setChecked(True)
+        ball_layout.addRow("", self.exclude_ballboys)
+
+        ball_group.setLayout(ball_layout)
+        scroll_layout.addWidget(ball_group)
+
+        # === DETECTION SETTINGS ===
+        detection_group = QGroupBox("Detection Sensitivity")
+        detection_layout = QFormLayout()
+
+        self.player_confidence = QDoubleSpinBox()
+        self.player_confidence.setRange(0.1, 1.0)
+        self.player_confidence.setSingleStep(0.05)
+        self.player_confidence.setValue(0.3)
+        detection_layout.addRow("Player Confidence:", self.player_confidence)
+
+        self.ball_confidence = QDoubleSpinBox()
+        self.ball_confidence.setRange(0.1, 1.0)
+        self.ball_confidence.setSingleStep(0.05)
+        self.ball_confidence.setValue(0.25)
+        detection_layout.addRow("Ball Confidence:", self.ball_confidence)
+
+        detection_group.setLayout(detection_layout)
+        scroll_layout.addWidget(detection_group)
+
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll)
+
+        # === BUTTONS ===
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel |
+            QDialogButtonBox.StandardButton.Apply
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        button_box.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self._apply_settings)
+        layout.addWidget(button_box)
+
+    def _on_field_type_changed(self, index):
+        """Update line colors based on field type selection"""
+        if index == 0:  # Soccer-only
+            self.soccer_line_color.set_color((255, 255, 255))
+        elif index == 1:  # Multi-sport
+            self.soccer_line_color.set_color((255, 255, 0))  # Yellow for soccer
+
+    def _apply_settings(self):
+        """Apply settings without closing dialog"""
+        self.log_message("Settings applied", "INFO")
+
+    def get_config(self):
+        """Return all configuration as a dictionary"""
+        return {
+            "home_team": {
+                "name": self.home_team_name.text(),
+                "primary_color": self.home_primary_color.get_color(),
+                "secondary_color": self.home_secondary_color.get_color(),
+                "goalkeeper_color": self.home_gk_color.get_color(),
+            },
+            "away_team": {
+                "name": self.away_team_name.text(),
+                "primary_color": self.away_primary_color.get_color(),
+                "secondary_color": self.away_secondary_color.get_color(),
+                "goalkeeper_color": self.away_gk_color.get_color(),
+            },
+            "referee_color": self.referee_color.get_color(),
+            "competition": self.competition.text(),
+            "venue": self.venue.text(),
+            "field": {
+                "type": self.field_type.currentText(),
+                "soccer_line_color": self.soccer_line_color.get_color(),
+                "other_line_color": self.other_line_color.get_color(),
+            },
+            "ball": {
+                "type": self.ball_type.currentText(),
+                "color": self.ball_color.get_color(),
+                "exclude_ballboys": self.exclude_ballboys.isChecked(),
+            },
+            "detection": {
+                "player_confidence": self.player_confidence.value(),
+                "ball_confidence": self.ball_confidence.value(),
+            }
+        }
+
+    def set_config(self, config: dict):
+        """Load configuration from dictionary"""
+        if "home_team" in config:
+            self.home_team_name.setText(config["home_team"].get("name", ""))
+            if "primary_color" in config["home_team"]:
+                self.home_primary_color.set_color(config["home_team"]["primary_color"])
+        if "away_team" in config:
+            self.away_team_name.setText(config["away_team"].get("name", ""))
+            if "primary_color" in config["away_team"]:
+                self.away_primary_color.set_color(config["away_team"]["primary_color"])
 
 
 class LogPanel(QTextEdit):
@@ -322,6 +585,43 @@ class ControlPanel(QGroupBox):
         self.analyze_btn.setEnabled(not analyzing)
         self.stop_btn.setEnabled(analyzing)
         self.depth_combo.setEnabled(not analyzing)
+        # Update button text to show current state
+        if analyzing:
+            self.analyze_btn.setText("⏳ Analysis Running...")
+            self.analyze_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #FF9800;
+                    color: white;
+                    font-weight: bold;
+                    padding: 8px 16px;
+                    border-radius: 4px;
+                }
+            """)
+        else:
+            self.analyze_btn.setText("🔍 Start Analysis")
+            self.analyze_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #4CAF50;
+                    color: white;
+                    font-weight: bold;
+                    padding: 8px 16px;
+                    border-radius: 4px;
+                }
+                QPushButton:hover {
+                    background-color: #45a049;
+                }
+                QPushButton:disabled {
+                    background-color: #666;
+                }
+            """)
+
+    def set_playing(self, playing: bool):
+        """Sync play button state with actual playback"""
+        self._is_playing = playing
+        if playing:
+            self.play_btn.setText("⏸ Pause")
+        else:
+            self.play_btn.setText("▶ Play")
 
 
 class MainWindow(QMainWindow):
@@ -446,11 +746,27 @@ class MainWindow(QMainWindow):
             }
         """)
         self.load_video_btn.clicked.connect(self.load_video)
-        
+
+        self.config_btn = QPushButton("⚙️ Game Settings")
+        self.config_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9C27B0;
+                color: white;
+                font-weight: bold;
+                padding: 10px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+        """)
+        self.config_btn.clicked.connect(self.open_game_config)
+
         self.export_btn = QPushButton("📊 Export Report")
         self.export_btn.setEnabled(False)
-        
+
         button_layout.addWidget(self.load_video_btn)
+        button_layout.addWidget(self.config_btn)
         button_layout.addWidget(self.export_btn)
         right_layout.addLayout(button_layout)
         
@@ -487,12 +803,20 @@ class MainWindow(QMainWindow):
         
         # Analysis menu
         analysis_menu = menubar.addMenu("&Analysis")
-        
+
         start_action = QAction("&Start Analysis", self)
         start_action.setShortcut("Ctrl+R")
         start_action.triggered.connect(lambda: self.start_analysis("standard"))
         analysis_menu.addAction(start_action)
-        
+
+        # Settings menu
+        settings_menu = menubar.addMenu("&Settings")
+
+        game_config_action = QAction("&Game Settings...", self)
+        game_config_action.setShortcut("Ctrl+G")
+        game_config_action.triggered.connect(self.open_game_config)
+        settings_menu.addAction(game_config_action)
+
         # Help menu
         help_menu = menubar.addMenu("&Help")
         
@@ -636,26 +960,28 @@ class MainWindow(QMainWindow):
         """Start video playback"""
         if self.video_info is None:
             return
-        
+
         self._is_playing = True
+        self.control_panel.set_playing(True)  # Sync button state
         interval = int(1000 / self.video_info.fps)  # milliseconds per frame
         self._playback_timer.start(interval)
-    
+
     def pause_video(self):
         """Pause video playback"""
         self._is_playing = False
+        self.control_panel.set_playing(False)  # Sync button state
         self._playback_timer.stop()
-    
+
     def _advance_frame(self):
         """Advance to next frame during playback"""
         if self.video_info is None:
             return
-        
+
         next_frame = self._current_frame + 1
         if next_frame >= self.video_info.total_frames:
-            self.pause_video()
+            self.pause_video()  # This will sync button state
             return
-        
+
         self.show_frame(next_frame)
     
     def seek_frame(self, delta_or_absolute: int):
@@ -720,6 +1046,42 @@ class MainWindow(QMainWindow):
     def log_message(self, message: str, level: str = "INFO"):
         """Add message to log panel"""
         self.log_panel.log(message, level)
+
+    def open_game_config(self):
+        """Open the game configuration dialog"""
+        dialog = GameConfigDialog(self)
+
+        # Load existing config if any
+        if hasattr(self, '_game_config'):
+            dialog.set_config(self._game_config)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._game_config = dialog.get_config()
+            self.log_message("Game configuration updated", "INFO")
+
+            # Apply team colors to classifier
+            if self.processor and self.processor.team_classifier:
+                home_color = self._game_config["home_team"]["primary_color"]
+                away_color = self._game_config["away_team"]["primary_color"]
+                self.processor.team_classifier.set_team_colors(home_color, away_color)
+                self.log_message(f"Team colors set: Home={home_color}, Away={away_color}", "INFO")
+
+            # Update team color boxes in UI
+            home_rgb = self._game_config["home_team"]["primary_color"]
+            away_rgb = self._game_config["away_team"]["primary_color"]
+            self.home_color_box.setStyleSheet(
+                f"background-color: rgb({home_rgb[0]}, {home_rgb[1]}, {home_rgb[2]}); border: 1px solid #333;"
+            )
+            self.away_color_box.setStyleSheet(
+                f"background-color: rgb({away_rgb[0]}, {away_rgb[1]}, {away_rgb[2]}); border: 1px solid #333;"
+            )
+
+            # Update video info label with team names
+            if self._game_config["home_team"]["name"] or self._game_config["away_team"]["name"]:
+                home_name = self._game_config["home_team"]["name"] or "Home"
+                away_name = self._game_config["away_team"]["name"] or "Away"
+                self.home_color_label.setText(f"{home_name}: ")
+                self.away_color_label.setText(f"{away_name}: ")
 
     def show_about(self):
         """Show about dialog"""
