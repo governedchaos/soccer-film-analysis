@@ -344,6 +344,7 @@ class SoccerDetector:
 
             # Handle ball detection
             if class_id == self.COCO_SPORTS_BALL:
+                logger.info(f"BALL DETECTED! confidence={confidence:.3f}, bbox={bbox}")
                 ball = BallDetection(
                     bbox=bbox,
                     confidence=confidence,
@@ -467,13 +468,14 @@ class SoccerDetector:
         if dominant_color is None:
             return "player"
 
-        # Check if color matches referee colors (use looser threshold of 100)
+        # Check if color matches referee colors (use looser threshold of 130)
+        # Yellow referee jerseys often appear as ~(225, 220, 115) due to lighting
         if self.referee_colors:
             for ref_color in self.referee_colors:
                 distance = self._color_distance(dominant_color, ref_color)
                 logger.debug(f"Referee color check: detected={dominant_color}, ref={ref_color}, distance={distance}")
-                if distance < 100:  # Increased from 60 to 100 for better matching
-                    logger.debug(f"Classified as REFEREE: color distance {distance}")
+                if distance < 130:  # Increased to 130 to catch yellows that appear slightly off
+                    logger.info(f"Classified as REFEREE: color={dominant_color}, distance={distance}")
                     return "referee"
 
         # Check if color matches goalkeeper colors
