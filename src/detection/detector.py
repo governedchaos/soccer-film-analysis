@@ -511,43 +511,77 @@ class SoccerDetector:
         bbox: Tuple[float, float, float, float]
     ) -> Optional[Tuple[int, int, int]]:
         """
-        Extract dominant color from the upper body region of a detection.
-        This is used for team classification.
+        Extract dominant jersey color from a player detection.
+        Uses improved algorithm with grass filtering and K-means clustering.
         """
         try:
             x1, y1, x2, y2 = map(int, bbox)
-            
-            # Get upper portion (jersey area)
+            width = x2 - x1
             height = y2 - y1
-            jersey_y1 = y1 + int(height * 0.1)  # Skip head area
-            jersey_y2 = y1 + int(height * 0.5)  # Upper body only
-            
+
+            # Focus on center of jersey area (avoid edges/background)
+            jersey_y1 = y1 + int(height * 0.15)  # Skip head
+            jersey_y2 = y1 + int(height * 0.45)  # Upper body only
+            jersey_x1 = x1 + int(width * 0.2)    # Avoid edges
+            jersey_x2 = x2 - int(width * 0.2)
+
             # Ensure valid coordinates
             jersey_y1 = max(0, min(jersey_y1, frame.shape[0] - 1))
             jersey_y2 = max(0, min(jersey_y2, frame.shape[0] - 1))
-            x1 = max(0, min(x1, frame.shape[1] - 1))
-            x2 = max(0, min(x2, frame.shape[1] - 1))
-            
-            if jersey_y2 <= jersey_y1 or x2 <= x1:
+            jersey_x1 = max(0, min(jersey_x1, frame.shape[1] - 1))
+            jersey_x2 = max(0, min(jersey_x2, frame.shape[1] - 1))
+
+            if jersey_y2 <= jersey_y1 or jersey_x2 <= jersey_x1:
                 return None
-            
-            roi = frame[jersey_y1:jersey_y2, x1:x2]
-            
-            if roi.size == 0:
+
+            roi = frame[jersey_y1:jersey_y2, jersey_x1:jersey_x2]
+
+            if roi.size == 0 or roi.shape[0] < 3 or roi.shape[1] < 3:
                 return None
-            
-            # Convert to RGB
+
+            # Convert to HSV to filter out grass
+            roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-            
-            # Reshape and find dominant color using k-means
-            pixels = roi_rgb.reshape(-1, 3).astype(np.float32)
-            
-            # Simple approach: use mean color (faster)
-            # For more accuracy, use k-means clustering
-            mean_color = np.mean(pixels, axis=0).astype(int)
-            
-            return tuple(mean_color)
-            
+
+            # Create mask to exclude grass-colored pixels (green hues)
+            # Grass is typically H: 30-90, high S
+            grass_mask = (
+                (roi_hsv[:, :, 0] >= 30) & (roi_hsv[:, :, 0] <= 90) &
+                (roi_hsv[:, :, 1] >= 40)
+            )
+
+            # Also exclude very dark pixels (shadows) and very bright (overexposed)
+            dark_mask = roi_hsv[:, :, 2] < 30
+            bright_mask = roi_hsv[:, :, 2] > 250
+
+            # Combined mask: exclude grass, shadows, and overexposed
+            exclude_mask = grass_mask | dark_mask | bright_mask
+
+            # Get valid pixels
+            valid_pixels = roi_rgb[~exclude_mask]
+
+            if len(valid_pixels) < 10:
+                # Fall back to simple mean if too few valid pixels
+                pixels = roi_rgb.reshape(-1, 3).astype(np.float32)
+                mean_color = np.mean(pixels, axis=0).astype(int)
+                return tuple(mean_color)
+
+            # Use K-means clustering to find dominant color (k=3 to handle variations)
+            pixels = valid_pixels.astype(np.float32)
+
+            # K-means with k=3 clusters
+            from sklearn.cluster import KMeans
+            n_clusters = min(3, len(pixels))
+            kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42, max_iter=50)
+            kmeans.fit(pixels)
+
+            # Find the largest cluster (most common color)
+            labels, counts = np.unique(kmeans.labels_, return_counts=True)
+            dominant_idx = labels[np.argmax(counts)]
+            dominant_color = kmeans.cluster_centers_[dominant_idx].astype(int)
+
+            return tuple(dominant_color)
+
         except Exception as e:
             logger.debug(f"Color extraction failed: {e}")
             return None

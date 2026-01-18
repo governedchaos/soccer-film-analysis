@@ -198,17 +198,63 @@ class Settings(BaseSettings):
         """Get the compute device (cuda, mps, or cpu)"""
         if not self.enable_gpu:
             return "cpu"
-        
+
         try:
             import torch
             if torch.cuda.is_available():
                 return "cuda"
-            elif torch.backends.mps.is_available():
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 return "mps"  # Apple Silicon
         except ImportError:
             pass
-        
+
         return "cpu"
+
+    def get_device_info(self) -> dict:
+        """Get detailed device information for diagnostics"""
+        info = {
+            "device": "cpu",
+            "gpu_enabled_in_settings": self.enable_gpu,
+            "cuda_available": False,
+            "cuda_version": None,
+            "cuda_device_count": 0,
+            "cuda_device_name": None,
+            "mps_available": False,
+            "torch_version": None,
+            "recommendation": None
+        }
+
+        try:
+            import torch
+            info["torch_version"] = torch.__version__
+
+            # Check CUDA
+            info["cuda_available"] = torch.cuda.is_available()
+            if info["cuda_available"]:
+                info["cuda_version"] = torch.version.cuda
+                info["cuda_device_count"] = torch.cuda.device_count()
+                if info["cuda_device_count"] > 0:
+                    info["cuda_device_name"] = torch.cuda.get_device_name(0)
+                info["device"] = "cuda"
+
+            # Check MPS (Apple Silicon)
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                info["mps_available"] = True
+                info["device"] = "mps"
+
+            # Recommendations
+            if not info["cuda_available"] and not info["mps_available"]:
+                info["recommendation"] = (
+                    "No GPU detected. For NVIDIA GPUs, install PyTorch with CUDA: "
+                    "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118"
+                )
+            elif not self.enable_gpu:
+                info["recommendation"] = "GPU available but disabled in settings. Set ENABLE_GPU=true in .env"
+
+        except ImportError:
+            info["recommendation"] = "PyTorch not installed. Run: pip install torch torchvision"
+
+        return info
 
 
 # Global settings instance

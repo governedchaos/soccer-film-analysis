@@ -115,12 +115,34 @@ class VideoProcessor:
         
         # Results storage
         self.frame_detections: Dict[int, FrameDetections] = {}
-        
+
+        # Detection statistics tracking
+        self._detection_stats = {
+            "frames_processed": 0,
+            "frames_with_ball": 0,
+            "frames_with_players": 0,
+            "total_player_detections": 0,
+            "total_referee_detections": 0,
+            "home_team_detections": 0,
+            "away_team_detections": 0,
+            "ball_detection_rate": 0.0,
+            "avg_players_per_frame": 0.0,
+        }
+
         # Callbacks
         self._progress_callback: Optional[Callable[[AnalysisProgress], None]] = None
         self._frame_callback: Optional[Callable[[np.ndarray, FrameDetections], None]] = None
-        
-        logger.info("VideoProcessor initialized")
+
+        # Log device info at startup
+        device_info = settings.get_device_info()
+        logger.info(f"VideoProcessor initialized")
+        logger.info(f"Compute device: {device_info['device']} | PyTorch: {device_info['torch_version']}")
+        if device_info['cuda_available']:
+            logger.info(f"CUDA: {device_info['cuda_version']} | GPU: {device_info['cuda_device_name']}")
+        elif device_info['mps_available']:
+            logger.info("Apple MPS acceleration enabled")
+        elif device_info['recommendation']:
+            logger.warning(device_info['recommendation'])
     
     def load_video(self, video_path: str | Path) -> VideoInfo:
         """
@@ -313,6 +335,9 @@ class VideoProcessor:
                     # Calculate possession
                     self.possession_calculator.calculate_possession(detections)
 
+                    # Update detection statistics
+                    self._update_detection_stats(detections)
+
                     # Store detections
                     self.frame_detections[frame_num] = detections
                 except Exception as detection_error:
@@ -367,12 +392,16 @@ class VideoProcessor:
                 f"{processed_frames} frames processed | "
                 f"{elapsed/60:.1f} minutes"
             )
-            
+
+            # Log detection statistics
+            self.log_detection_stats()
+
             return {
                 "status": "completed",
                 "processed_frames": processed_frames,
                 "elapsed_seconds": elapsed,
-                "session_id": session_id
+                "session_id": session_id,
+                "detection_stats": self.get_detection_stats()
             }
             
         except Exception as e:
@@ -403,13 +432,82 @@ class VideoProcessor:
         frame = self.get_frame(frame_number)
         if frame is None:
             return None
-        
+
         detections = self.frame_detections.get(frame_number)
         if detections:
             return draw_detections(frame, detections)
-        
+
         return frame
-    
+
+    def _update_detection_stats(self, detections: FrameDetections):
+        """Update running detection statistics"""
+        self._detection_stats["frames_processed"] += 1
+
+        # Ball detection
+        if detections.ball is not None:
+            self._detection_stats["frames_with_ball"] += 1
+
+        # Player detections
+        num_players = len(detections.players)
+        num_refs = len(detections.referees)
+        num_gk = len(detections.goalkeepers)
+
+        if num_players > 0 or num_gk > 0:
+            self._detection_stats["frames_with_players"] += 1
+
+        self._detection_stats["total_player_detections"] += num_players + num_gk
+        self._detection_stats["total_referee_detections"] += num_refs
+
+        # Team counts
+        for player in detections.players + detections.goalkeepers:
+            if player.team_id == 0:
+                self._detection_stats["home_team_detections"] += 1
+            elif player.team_id == 1:
+                self._detection_stats["away_team_detections"] += 1
+
+        # Update rates
+        frames = self._detection_stats["frames_processed"]
+        if frames > 0:
+            self._detection_stats["ball_detection_rate"] = (
+                self._detection_stats["frames_with_ball"] / frames * 100
+            )
+            self._detection_stats["avg_players_per_frame"] = (
+                self._detection_stats["total_player_detections"] / frames
+            )
+
+    def get_detection_stats(self) -> Dict[str, Any]:
+        """Get current detection statistics"""
+        return self._detection_stats.copy()
+
+    def log_detection_stats(self):
+        """Log detection statistics summary"""
+        stats = self._detection_stats
+        logger.info("=" * 50)
+        logger.info("DETECTION STATISTICS SUMMARY")
+        logger.info("=" * 50)
+        logger.info(f"Frames processed: {stats['frames_processed']}")
+        logger.info(f"Ball detection rate: {stats['ball_detection_rate']:.1f}%")
+        logger.info(f"Avg players per frame: {stats['avg_players_per_frame']:.1f}")
+        logger.info(f"Total player detections: {stats['total_player_detections']}")
+        logger.info(f"  - Home team: {stats['home_team_detections']}")
+        logger.info(f"  - Away team: {stats['away_team_detections']}")
+        logger.info(f"Referee detections: {stats['total_referee_detections']}")
+        logger.info("=" * 50)
+
+    def reset_detection_stats(self):
+        """Reset detection statistics"""
+        self._detection_stats = {
+            "frames_processed": 0,
+            "frames_with_ball": 0,
+            "frames_with_players": 0,
+            "total_player_detections": 0,
+            "total_referee_detections": 0,
+            "home_team_detections": 0,
+            "away_team_detections": 0,
+            "ball_detection_rate": 0.0,
+            "avg_players_per_frame": 0.0,
+        }
+
     def iterate_frames(
         self,
         start_frame: int = 0,
