@@ -15,7 +15,7 @@ from loguru import logger
 
 from config import settings, AnalysisDepth
 from src.detection.detector import (
-    SoccerDetector, TeamClassifier, PitchTransformer,
+    SoccerDetector, TeamClassifier, PitchTransformer, PossessionCalculator,
     FrameDetections, PlayerDetection, draw_detections
 )
 from src.database.models import (
@@ -85,19 +85,22 @@ class VideoProcessor:
         self,
         detector: Optional[SoccerDetector] = None,
         team_classifier: Optional[TeamClassifier] = None,
-        pitch_transformer: Optional[PitchTransformer] = None
+        pitch_transformer: Optional[PitchTransformer] = None,
+        possession_calculator: Optional[PossessionCalculator] = None
     ):
         """
         Initialize the video processor.
-        
+
         Args:
             detector: SoccerDetector instance (created if not provided)
             team_classifier: TeamClassifier instance
             pitch_transformer: PitchTransformer instance
+            possession_calculator: PossessionCalculator instance
         """
         self.detector = detector or SoccerDetector()
         self.team_classifier = team_classifier or TeamClassifier()
         self.pitch_transformer = pitch_transformer or PitchTransformer()
+        self.possession_calculator = possession_calculator or PossessionCalculator()
         
         # Video info
         self.video_info: Optional[VideoInfo] = None
@@ -298,12 +301,15 @@ class VideoProcessor:
                 try:
                     detections = self.detector.detect_frame(
                         frame, frame_num, self.video_info.fps,
-                        detect_pitch=True, track_objects=True
+                        detect_pitch=False, track_objects=True
                     )
 
                     # Classify teams
                     self.team_classifier.classify_players(detections.players)
                     self.team_classifier.classify_players(detections.goalkeepers)
+
+                    # Calculate possession
+                    self.possession_calculator.calculate_possession(detections)
 
                     # Store detections
                     self.frame_detections[frame_num] = detections

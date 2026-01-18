@@ -1,6 +1,7 @@
 """
 Soccer Film Analysis - Detection Pipeline
-Uses Roboflow Sports library for player, ball, and pitch detection
+Uses local YOLO models for player, ball, and pitch detection
+No API key required - runs entirely offline
 """
 
 import cv2
@@ -10,23 +11,30 @@ from typing import List, Dict, Optional, Tuple, Any
 from pathlib import Path
 from loguru import logger
 
-# Roboflow & Supervision imports
+# Ultralytics YOLO - Local models
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    logger.warning("Ultralytics YOLO not available. Install with: pip install ultralytics")
+
+# Supervision for tracking and utilities
 try:
     import supervision as sv
-    from inference import get_model
-    ROBOFLOW_AVAILABLE = True
+    SUPERVISION_AVAILABLE = True
 except ImportError:
-    ROBOFLOW_AVAILABLE = False
-    logger.warning("Roboflow/Supervision not available. Install with: pip install supervision inference roboflow")
+    SUPERVISION_AVAILABLE = False
+    logger.warning("Supervision not available. Install with: pip install supervision")
 
-# Import sports library if available
+# Import sports library if available (optional - for pitch visualization)
 try:
     from sports.configs.soccer import SoccerFieldConfiguration
     from sports.annotators.soccer import draw_pitch, draw_points_on_pitch
     SPORTS_AVAILABLE = True
 except ImportError:
     SPORTS_AVAILABLE = False
-    logger.warning("Roboflow Sports not available. Install with: pip install git+https://github.com/roboflow/sports.git")
+    logger.debug("Roboflow Sports not available (optional). Install with: pip install git+https://github.com/roboflow/sports.git")
 
 from config import settings
 
@@ -108,89 +116,116 @@ class FrameDetections:
 
 class SoccerDetector:
     """
-    Main detection class using Roboflow models for soccer analysis.
-    
+    Main detection class using local YOLO models for soccer analysis.
+    No API key required - runs entirely offline.
+
     Uses:
-    - Player detection model (detects players, goalkeepers, referees, ball)
-    - Pitch detection model (detects field lines and keypoints)
+    - YOLOv8 for person detection (players, goalkeepers, referees)
+    - YOLOv8 for ball detection
+    - Color-based classification for team assignment
+    - Position heuristics for role classification (goalkeeper, referee)
     """
-    
-    # Class mappings for player detection model
-    CLASS_NAMES = {
-        0: "ball",
-        1: "goalkeeper",
-        2: "player",
-        3: "referee"
+
+    # YOLO COCO class IDs we care about
+    COCO_PERSON = 0
+    COCO_SPORTS_BALL = 32
+
+    # Available YOLO model sizes (downloaded automatically on first use)
+    MODEL_SIZES = {
+        "nano": "yolov8n.pt",      # Fastest, least accurate (3.2M params)
+        "small": "yolov8s.pt",     # Good balance (11.2M params)
+        "medium": "yolov8m.pt",    # Better accuracy (25.9M params)
+        "large": "yolov8l.pt",     # High accuracy (43.7M params)
+        "xlarge": "yolov8x.pt",    # Best accuracy (68.2M params)
     }
-    
+
     def __init__(
         self,
-        player_model_id: Optional[str] = None,
-        pitch_model_id: Optional[str] = None,
-        api_key: Optional[str] = None,
-        device: Optional[str] = None
+        model_size: str = "small",
+        device: Optional[str] = None,
+        models_dir: Optional[Path] = None
     ):
         """
-        Initialize the detector with Roboflow models.
-        
+        Initialize the detector with local YOLO models.
+
         Args:
-            player_model_id: Roboflow model ID for player detection
-            pitch_model_id: Roboflow model ID for pitch keypoint detection  
-            api_key: Roboflow API key (uses settings if not provided)
-            device: Compute device (cuda, mps, cpu)
+            model_size: YOLO model size - "nano", "small", "medium", "large", "xlarge"
+            device: Compute device (cuda, mps, cpu) - auto-detected if None
+            models_dir: Directory to store downloaded models
         """
-        if not ROBOFLOW_AVAILABLE:
-            raise ImportError("Roboflow dependencies not installed. Run: pip install supervision inference roboflow")
-        
-        self.api_key = api_key or settings.roboflow_api_key
+        if not YOLO_AVAILABLE:
+            raise ImportError("Ultralytics YOLO not installed. Run: pip install ultralytics")
+
         self.device = device or settings.get_device()
-        
-        # Model IDs
-        self.player_model_id = player_model_id or settings.player_detection_model
-        self.pitch_model_id = pitch_model_id or settings.pitch_detection_model
-        
+        self.model_size = model_size
+        self.models_dir = models_dir or settings.get_models_dir()
+
+        # Get model filename
+        if model_size in self.MODEL_SIZES:
+            self.model_file = self.MODEL_SIZES[model_size]
+        else:
+            # Allow custom model path
+            self.model_file = model_size
+
         # Models (lazy loaded)
-        self._player_model = None
-        self._pitch_model = None
-        
+        self._model = None
+
         # Tracking
         self._tracker = None
-        
+
         # Team classifier
         self._team_classifier = None
-        
+
+        # Referee/goalkeeper color hints (can be set manually)
+        self.referee_colors: List[Tuple[int, int, int]] = []  # RGB colors
+        self.goalkeeper_colors: Dict[int, Tuple[int, int, int]] = {}  # team_id -> RGB
+
+        # Field boundary for position-based classification
+        self.field_bounds: Optional[Tuple[int, int, int, int]] = None  # x1, y1, x2, y2
+
         # Pitch configuration
         self.pitch_config = None
         if SPORTS_AVAILABLE:
             self.pitch_config = SoccerFieldConfiguration()
-        
-        logger.info(f"SoccerDetector initialized (device: {self.device})")
-    
+
+        logger.info(f"SoccerDetector initialized (model: {self.model_file}, device: {self.device})")
+
     @property
-    def player_model(self):
-        """Lazy load player detection model"""
-        if self._player_model is None:
-            logger.info(f"Loading player detection model: {self.player_model_id}")
-            self._player_model = get_model(
-                model_id=self.player_model_id,
-                api_key=self.api_key
-            )
-        return self._player_model
-    
-    @property
-    def pitch_model(self):
-        """Lazy load pitch detection model"""
-        if self._pitch_model is None:
-            logger.info(f"Loading pitch detection model: {self.pitch_model_id}")
-            self._pitch_model = get_model(
-                model_id=self.pitch_model_id,
-                api_key=self.api_key
-            )
-        return self._pitch_model
-    
+    def model(self):
+        """Lazy load YOLO model"""
+        if self._model is None:
+            model_path = self.models_dir / self.model_file
+
+            # If model doesn't exist locally, YOLO will download it automatically
+            if model_path.exists():
+                logger.info(f"Loading local YOLO model: {model_path}")
+                self._model = YOLO(str(model_path))
+            else:
+                logger.info(f"Downloading YOLO model: {self.model_file}")
+                self._model = YOLO(self.model_file)
+
+                # Save to models directory for future use
+                try:
+                    import shutil
+                    # The model is cached in ultralytics cache, copy it
+                    cache_path = Path.home() / ".cache" / "ultralytics" / self.model_file
+                    if cache_path.exists():
+                        shutil.copy(cache_path, model_path)
+                        logger.info(f"Model saved to: {model_path}")
+                except Exception as e:
+                    logger.debug(f"Could not copy model to models dir: {e}")
+
+            # Set device
+            self._model.to(self.device)
+
+        return self._model
+
     @property
     def tracker(self):
         """Get ByteTrack tracker for object tracking"""
+        if not SUPERVISION_AVAILABLE:
+            return None
+
         if self._tracker is None:
             self._tracker = sv.ByteTrack(
                 track_activation_threshold=0.25,
@@ -205,135 +240,270 @@ class SoccerDetector:
         frame: np.ndarray,
         frame_number: int,
         fps: float = 30.0,
-        detect_pitch: bool = True,
+        detect_pitch: bool = False,  # Pitch detection requires separate model
         track_objects: bool = True,
         confidence_threshold: Optional[float] = None
     ) -> FrameDetections:
         """
-        Run detection on a single frame.
-        
+        Run detection on a single frame using local YOLO models.
+
         Args:
             frame: BGR image as numpy array
             frame_number: Current frame number
             fps: Video frames per second
-            detect_pitch: Whether to also detect pitch keypoints
+            detect_pitch: Whether to also detect pitch keypoints (requires sports lib)
             track_objects: Whether to apply tracking for persistent IDs
             confidence_threshold: Override default confidence threshold
-            
+
         Returns:
             FrameDetections object with all detected objects
         """
-        conf = confidence_threshold or settings.player_confidence_threshold
+        player_conf = confidence_threshold or settings.player_confidence_threshold
+        ball_conf = settings.ball_confidence_threshold
+        # Use the lower threshold to catch both, then filter by class
+        min_conf = min(player_conf, ball_conf, 0.15)  # Ball needs low confidence
         timestamp = frame_number / fps
-        
+
         # Initialize results
         results = FrameDetections(
             frame_number=frame_number,
             timestamp_seconds=timestamp
         )
-        
-        # Run player detection
+
+        # Run YOLO detection
         try:
-            player_results = self.player_model.infer(frame, confidence=conf)[0]
-            detections = sv.Detections.from_inference(player_results)
-            
-            # Apply tracking if enabled
-            if track_objects and len(detections) > 0:
-                detections = self.tracker.update_with_detections(detections)
-            
-            # Store raw detections
-            results.raw_detections = detections
-            
-            # Parse detections into typed objects
-            self._parse_player_detections(frame, detections, results)
-            
+            # Run inference with lower threshold to catch balls
+            yolo_results = self.model.predict(
+                frame,
+                conf=min_conf,
+                verbose=False,
+                classes=[self.COCO_PERSON, self.COCO_SPORTS_BALL]  # Only detect persons and sports balls
+            )[0]
+
+            # Convert to supervision Detections for tracking
+            if SUPERVISION_AVAILABLE:
+                detections = sv.Detections.from_ultralytics(yolo_results)
+
+                # Apply tracking if enabled
+                if track_objects and len(detections) > 0 and self.tracker is not None:
+                    detections = self.tracker.update_with_detections(detections)
+
+                # Store raw detections
+                results.raw_detections = detections
+
+                # Parse detections into typed objects
+                self._parse_yolo_detections(frame, detections, results)
+            else:
+                # Fallback without supervision - parse YOLO results directly
+                self._parse_yolo_results_direct(frame, yolo_results, results)
+
         except Exception as e:
-            logger.error(f"Player detection failed on frame {frame_number}: {e}")
-        
-        # Run pitch detection if requested
-        if detect_pitch:
-            try:
-                pitch_results = self.pitch_model.infer(frame, confidence=settings.pitch_confidence_threshold)[0]
-                self._parse_pitch_detections(pitch_results, results)
-            except Exception as e:
-                logger.debug(f"Pitch detection failed on frame {frame_number}: {e}")
+            logger.error(f"Detection failed on frame {frame_number}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
         
         return results
-    
-    def _parse_player_detections(
+
+    def _parse_yolo_detections(
         self,
         frame: np.ndarray,
-        detections: sv.Detections,
+        detections: Any,  # sv.Detections
         results: FrameDetections
     ):
-        """Parse supervision detections into typed detection objects"""
-        
+        """Parse supervision Detections from YOLO into typed detection objects"""
+
         for i in range(len(detections)):
             bbox = tuple(detections.xyxy[i])
             confidence = float(detections.confidence[i]) if detections.confidence is not None else 0.0
-            class_id = int(detections.class_id[i]) if detections.class_id is not None else 2
+            class_id = int(detections.class_id[i]) if detections.class_id is not None else 0
             tracker_id = int(detections.tracker_id[i]) if detections.tracker_id is not None else None
-            
-            class_name = self.CLASS_NAMES.get(class_id, "unknown")
-            
-            # Extract dominant color from detection region
-            dominant_color = self._extract_dominant_color(frame, bbox)
-            
-            if class_name == "ball":
+
+            # Extract dominant color from detection region (for persons)
+            dominant_color = None
+            if class_id == self.COCO_PERSON:
+                dominant_color = self._extract_dominant_color(frame, bbox)
+
+            # Handle ball detection
+            if class_id == self.COCO_SPORTS_BALL:
                 ball = BallDetection(
                     bbox=bbox,
                     confidence=confidence,
                     class_id=class_id,
-                    class_name=class_name,
+                    class_name="ball",
                     tracker_id=tracker_id
                 )
                 results.ball = ball
-                
-            elif class_name == "referee":
-                ref = PlayerDetection(
+
+            # Handle person detection - classify as player, goalkeeper, or referee
+            elif class_id == self.COCO_PERSON:
+                role = self._classify_person_role(frame, bbox, dominant_color)
+
+                if role == "referee":
+                    ref = PlayerDetection(
+                        bbox=bbox,
+                        confidence=confidence,
+                        class_id=class_id,
+                        class_name="referee",
+                        tracker_id=tracker_id,
+                        is_referee=True,
+                        dominant_color=dominant_color
+                    )
+                    results.referees.append(ref)
+
+                elif role == "goalkeeper":
+                    gk = PlayerDetection(
+                        bbox=bbox,
+                        confidence=confidence,
+                        class_id=class_id,
+                        class_name="goalkeeper",
+                        tracker_id=tracker_id,
+                        is_goalkeeper=True,
+                        dominant_color=dominant_color
+                    )
+                    results.goalkeepers.append(gk)
+
+                else:  # player
+                    player = PlayerDetection(
+                        bbox=bbox,
+                        confidence=confidence,
+                        class_id=class_id,
+                        class_name="player",
+                        tracker_id=tracker_id,
+                        dominant_color=dominant_color
+                    )
+                    results.players.append(player)
+
+    def _parse_yolo_results_direct(
+        self,
+        frame: np.ndarray,
+        yolo_results: Any,
+        results: FrameDetections
+    ):
+        """Parse YOLO results directly without supervision (fallback)"""
+        if yolo_results.boxes is None:
+            return
+
+        boxes = yolo_results.boxes
+        for i in range(len(boxes)):
+            bbox = tuple(boxes.xyxy[i].cpu().numpy())
+            confidence = float(boxes.conf[i].cpu().numpy())
+            class_id = int(boxes.cls[i].cpu().numpy())
+
+            # Extract dominant color for persons
+            dominant_color = None
+            if class_id == self.COCO_PERSON:
+                dominant_color = self._extract_dominant_color(frame, bbox)
+
+            # Handle ball
+            if class_id == self.COCO_SPORTS_BALL:
+                ball = BallDetection(
                     bbox=bbox,
                     confidence=confidence,
                     class_id=class_id,
-                    class_name=class_name,
-                    tracker_id=tracker_id,
-                    is_referee=True,
-                    dominant_color=dominant_color
+                    class_name="ball",
+                    tracker_id=None
                 )
-                results.referees.append(ref)
-                
-            elif class_name == "goalkeeper":
-                gk = PlayerDetection(
-                    bbox=bbox,
-                    confidence=confidence,
-                    class_id=class_id,
-                    class_name=class_name,
-                    tracker_id=tracker_id,
-                    is_goalkeeper=True,
-                    dominant_color=dominant_color
-                )
-                results.goalkeepers.append(gk)
-                
-            else:  # player
+                results.ball = ball
+
+            # Handle person
+            elif class_id == self.COCO_PERSON:
+                role = self._classify_person_role(frame, bbox, dominant_color)
                 player = PlayerDetection(
                     bbox=bbox,
                     confidence=confidence,
                     class_id=class_id,
-                    class_name=class_name,
-                    tracker_id=tracker_id,
+                    class_name=role,
+                    tracker_id=None,
+                    is_referee=(role == "referee"),
+                    is_goalkeeper=(role == "goalkeeper"),
                     dominant_color=dominant_color
                 )
-                results.players.append(player)
-    
-    def _parse_pitch_detections(self, pitch_results: Any, results: FrameDetections):
-        """Parse pitch keypoint detection results"""
-        if hasattr(pitch_results, 'keypoints') and pitch_results.keypoints:
-            for i, kp in enumerate(pitch_results.keypoints):
-                results.pitch_keypoints.append(PitchKeypoint(
-                    point_id=i,
-                    x=kp.x,
-                    y=kp.y,
-                    confidence=kp.confidence if hasattr(kp, 'confidence') else 1.0
-                ))
+                if role == "referee":
+                    results.referees.append(player)
+                elif role == "goalkeeper":
+                    results.goalkeepers.append(player)
+                else:
+                    results.players.append(player)
+
+    def _classify_person_role(
+        self,
+        frame: np.ndarray,
+        bbox: Tuple[float, float, float, float],
+        dominant_color: Optional[Tuple[int, int, int]]
+    ) -> str:
+        """
+        Classify a detected person as player, goalkeeper, or referee.
+
+        Uses color matching against known referee/goalkeeper colors and
+        position heuristics.
+
+        Args:
+            frame: The video frame
+            bbox: Bounding box (x1, y1, x2, y2)
+            dominant_color: Extracted jersey color (RGB)
+
+        Returns:
+            "player", "goalkeeper", or "referee"
+        """
+        if dominant_color is None:
+            return "player"
+
+        # Check if color matches referee colors (use looser threshold of 100)
+        if self.referee_colors:
+            for ref_color in self.referee_colors:
+                distance = self._color_distance(dominant_color, ref_color)
+                logger.debug(f"Referee color check: detected={dominant_color}, ref={ref_color}, distance={distance}")
+                if distance < 100:  # Increased from 60 to 100 for better matching
+                    logger.debug(f"Classified as REFEREE: color distance {distance}")
+                    return "referee"
+
+        # Check if color matches goalkeeper colors
+        for team_id, gk_color in self.goalkeeper_colors.items():
+            distance = self._color_distance(dominant_color, gk_color)
+            if distance < 100:  # Increased threshold
+                logger.debug(f"Classified as GOALKEEPER: color distance {distance}")
+                return "goalkeeper"
+
+        # Position-based heuristic: goalkeepers are often near the edges
+        if self.field_bounds:
+            x1, y1, x2, y2 = bbox
+            cx = (x1 + x2) / 2
+            field_x1, _, field_x2, _ = self.field_bounds
+            field_width = field_x2 - field_x1
+
+            # If person is in the outer 15% of the field width, might be goalkeeper
+            edge_threshold = field_width * 0.15
+            if cx < field_x1 + edge_threshold or cx > field_x2 - edge_threshold:
+                # Additional check: is the color very different from typical player colors?
+                # This is a simple heuristic, real implementation would use learned classifier
+                pass
+
+        return "player"
+
+    def _color_distance(
+        self,
+        color1: Tuple[int, int, int],
+        color2: Tuple[int, int, int]
+    ) -> float:
+        """Calculate Euclidean distance between two RGB colors"""
+        return np.sqrt(sum((c1 - c2) ** 2 for c1, c2 in zip(color1, color2)))
+
+    def set_referee_colors(self, colors: List[Tuple[int, int, int]]):
+        """Set known referee jersey colors (RGB)"""
+        self.referee_colors = colors
+        logger.info(f"Referee colors set: {colors}")
+
+    def set_goalkeeper_colors(
+        self,
+        home_gk_color: Optional[Tuple[int, int, int]] = None,
+        away_gk_color: Optional[Tuple[int, int, int]] = None
+    ):
+        """Set known goalkeeper jersey colors (RGB)"""
+        if home_gk_color:
+            self.goalkeeper_colors[0] = home_gk_color
+        if away_gk_color:
+            self.goalkeeper_colors[1] = away_gk_color
+        logger.info(f"Goalkeeper colors set: {self.goalkeeper_colors}")
     
     def _extract_dominant_color(
         self,
@@ -485,6 +655,97 @@ class TeamClassifier:
         self._is_fitted = True
         
         logger.info(f"Team colors manually set: Home={home_color}, Away={away_color}")
+
+
+# ============================================
+# Possession Calculator
+# ============================================
+
+class PossessionCalculator:
+    """
+    Calculates ball possession based on player proximity to the ball.
+    """
+
+    def __init__(self, proximity_threshold: float = 100.0):
+        """
+        Args:
+            proximity_threshold: Maximum distance (pixels) for possession attribution
+        """
+        self.proximity_threshold = proximity_threshold
+        self.possession_history: List[Optional[int]] = []  # team_id or None
+        self.home_frames = 0
+        self.away_frames = 0
+        self.contested_frames = 0
+
+    def calculate_possession(self, detections: FrameDetections) -> Optional[int]:
+        """
+        Determine which team has possession based on player proximity to ball.
+
+        Args:
+            detections: Frame detections with players and ball
+
+        Returns:
+            Team ID (0=home, 1=away) or None if no possession
+        """
+        if detections.ball is None:
+            self.possession_history.append(None)
+            self.contested_frames += 1
+            return None
+
+        ball_center = detections.ball.center
+
+        # Find closest player to ball
+        closest_player = None
+        min_distance = float('inf')
+
+        all_players = detections.players + detections.goalkeepers
+        for player in all_players:
+            player_center = player.center
+            distance = np.sqrt(
+                (player_center[0] - ball_center[0]) ** 2 +
+                (player_center[1] - ball_center[1]) ** 2
+            )
+
+            if distance < min_distance:
+                min_distance = distance
+                closest_player = player
+
+        # Attribute possession if player is close enough
+        if closest_player and min_distance < self.proximity_threshold:
+            team_id = closest_player.team_id
+            if team_id is not None and team_id >= 0:
+                self.possession_history.append(team_id)
+                if team_id == 0:
+                    self.home_frames += 1
+                else:
+                    self.away_frames += 1
+                return team_id
+
+        self.possession_history.append(None)
+        self.contested_frames += 1
+        return None
+
+    def get_possession_percentage(self) -> Tuple[float, float]:
+        """
+        Get possession percentage for each team.
+
+        Returns:
+            (home_percentage, away_percentage)
+        """
+        total = self.home_frames + self.away_frames
+        if total == 0:
+            return (50.0, 50.0)
+
+        home_pct = (self.home_frames / total) * 100
+        away_pct = (self.away_frames / total) * 100
+        return (home_pct, away_pct)
+
+    def reset(self):
+        """Reset possession tracking"""
+        self.possession_history.clear()
+        self.home_frames = 0
+        self.away_frames = 0
+        self.contested_frames = 0
 
 
 # ============================================

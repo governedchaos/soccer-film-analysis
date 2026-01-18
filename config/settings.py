@@ -52,9 +52,9 @@ class Settings(BaseSettings):
         return f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
     
     # ==========================================
-    # API Keys
+    # API Keys (Optional - local models work without API keys)
     # ==========================================
-    roboflow_api_key: str = Field(default="", description="Roboflow API key for detection models")
+    roboflow_api_key: str = Field(default="", description="Roboflow API key (optional - only needed for Roboflow models)")
     
     # ==========================================
     # Logging
@@ -160,7 +160,17 @@ class Settings(BaseSettings):
     # ==========================================
     # Model Configuration
     # ==========================================
-    # Roboflow model IDs for soccer detection
+    # Local YOLO model settings (no API key required)
+    yolo_model_size: str = Field(
+        default="small",
+        description="YOLO model size: nano, small, medium, large, xlarge"
+    )
+    use_local_models: bool = Field(
+        default=True,
+        description="Use local YOLO models (True) or Roboflow API (False)"
+    )
+
+    # Legacy Roboflow model IDs (only used if use_local_models=False)
     player_detection_model: str = Field(
         default="football-players-detection-3zvbc/10",
         description="Roboflow model ID for player detection"
