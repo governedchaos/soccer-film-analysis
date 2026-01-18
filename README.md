@@ -1,6 +1,6 @@
 # Soccer Film Analysis
 
-A comprehensive high school soccer game film analysis application that uses computer vision to detect players, track movements, identify events, and generate detailed analytics.
+A comprehensive high school soccer game film analysis application using local computer vision models. No API keys required - runs entirely offline using YOLOv8 for detection.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -8,57 +8,67 @@ A comprehensive high school soccer game film analysis application that uses comp
 
 ## Features
 
-### Core Detection
-- **Player Detection & Tracking** - Identify and track all players with persistent IDs
-- **Team Classification** - Automatically differentiate teams by jersey color
-- **Ball Tracking** - Real-time ball detection and possession analysis
-- **Referee Detection** - Identify and exclude referees from team statistics
-- **Pitch Detection** - Detect field boundaries for coordinate transformation
+### Core Detection (Runs Offline - No API Required)
+- **Player Detection & Tracking** - YOLOv8 with ByteTrack for persistent player IDs
+- **Team Classification** - K-means clustering on jersey colors with persistent tracking
+- **Ball Tracking** - Multi-method detection (YOLO + color-based fallback + interpolation)
+- **Referee Detection** - Automatic classification based on color patterns (black, bright colors)
+- **Pitch Boundary Detection** - Grass segmentation and line detection to filter out-of-bounds
+- **Enhanced Tracking** - Stable team assignments that don't flicker between frames
 
-### Analytics
-- **Event Detection** - Goals, shots, passes, turnovers, tackles, saves
-- **Team Metrics** - Possession, passing accuracy, formations, pressing intensity
-- **Player Metrics** - Distance, speed, sprints, passes, shots, performance rating
-- **Advanced Stats** - Expected Goals (xG), passing networks, heatmaps
+### Tactical Analytics
+- **Formation Detection** - Auto-detect 10+ formations (4-4-2, 4-3-3, 3-5-2, etc.)
+- **Expected Goals (xG)** - Shot quality model with distance, angle, pressure factors
+- **Expected Threat (xT)** - Ball progression value using 12x8 zone grid
+- **Pressing Analysis** - PPDA calculation and pressing intensity metrics
+- **Team Shape Analysis** - Compactness, width, defensive line tracking
+- **Space Creation** - Off-ball movement and third-man run detection
+- **Counter-Attack Detection** - Automatic identification of counter-attacking plays
+- **Duel Statistics** - Aerial and ground duel tracking with win rates
 
-### Visualization
-- **Real-time Overlay** - Live detection boxes during playback
-- **Heatmaps** - Player and team movement visualization
-- **Formation Display** - 2D pitch representation with player positions
-- **Event Timeline** - Navigate to specific game events
+### Advanced Features
+- **Goalkeeper Analysis** - Distribution patterns, saves, positioning
+- **Set Piece Analysis** - Corner and free kick pattern detection
+- **Passing Lane Analysis** - Lane blocking and available passing options
+- **Fatigue Detection** - Speed/sprint decline tracking per player
+- **Opponent Tendency Prediction** - Pattern analysis for scouting
+- **Bird's Eye View** - Homography transformation for tactical view
 
 ### Application
 - **Modern GUI** - PyQt6-based interface with dark theme
-- **Analysis Depth Levels** - Quick (5-10 min), Standard (20-30 min), Deep (45-60 min)
-- **Report Generation** - HTML, PDF, Excel exports
-- **Database Storage** - PostgreSQL for persistent data
+- **Real-time Stats Panel** - Live possession, shots, passes, detection quality
+- **Video Caching** - Background preprocessing for faster analysis
+- **PDF Reports** - Comprehensive match reports with charts and diagrams
+- **Database Storage** - PostgreSQL for persistent game/player data
+- **Cloud Sync** - Backup to local folders or Google Drive
 
 ## Technology Stack
 
 | Component | Technology |
 |-----------|------------|
-| Detection | Roboflow Sports, YOLOv8, Supervision |
+| Detection | YOLOv8 (local models, no API needed) |
 | Tracking | ByteTrack via Supervision |
 | GUI | PyQt6 |
-| Database | PostgreSQL with SQLAlchemy |
-| Visualization | OpenCV, matplotlib, mplsoccer |
-| Reporting | Jinja2, WeasyPrint, openpyxl |
+| Database | PostgreSQL with psycopg2 |
+| Analytics | NumPy, SciPy, scikit-learn |
+| Visualization | OpenCV, matplotlib |
+| Reporting | ReportLab (PDF), Jinja2 (HTML) |
 
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.10+
-- PostgreSQL 14+
-- GPU recommended (CUDA for NVIDIA, MPS for Apple Silicon)
-- [Roboflow API Key](https://app.roboflow.com/) (free tier available)
+- PostgreSQL 14+ (for database features)
+- GPU recommended but not required (CUDA for NVIDIA, MPS for Apple Silicon)
+- **No API keys required** - all detection runs locally
 
 ### Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/soccer_film_analysis.git
-cd soccer_film_analysis
+git clone https://github.com/governedchaos/soccer-film-analysis.git
+cd soccer-film-analysis
 
 # Create virtual environment
 python -m venv venv
@@ -69,122 +79,78 @@ venv\Scripts\activate  # Windows
 # Install dependencies
 pip install -r requirements.txt
 
-# Install Roboflow Sports (if not in requirements)
-pip install git+https://github.com/roboflow/sports.git
-
-# Copy and configure environment
+# Copy and configure environment (optional - for database)
 cp .env.example .env
-# Edit .env with your settings (database credentials, Roboflow API key)
+# Edit .env with your PostgreSQL credentials if using database features
 ```
 
-### Database Setup
+### First Run
+
+The first time you run the app, YOLOv8 models will be downloaded automatically (~25MB).
 
 ```bash
-# Make sure PostgreSQL is running, then:
+# Launch GUI Application
+python -m src.gui.main_window
+
+# Or use the run script
+./run.sh gui      # Linux/Mac
+run.bat gui       # Windows
+```
+
+### Database Setup (Optional)
+
+If you want to persist game data across sessions:
+
+```bash
+# Make sure PostgreSQL is running
 python scripts/setup_database.py
 ```
 
-### Running the Application
+## Usage
+
+### GUI Mode
+
+1. Launch the application: `python -m src.gui.main_window`
+2. Click "Open Video" to load a game recording
+3. Set team colors using the color picker (or let auto-detection work)
+4. Click "Start Analysis" to begin processing
+5. View real-time detection and statistics
+6. Export results as PDF or save to database
+
+### Command Line Mode
 
 ```bash
-# GUI Application
-python -m src.gui.main_window
+# Quick analysis (fastest, samples frames)
+python scripts/run_analysis.py path/to/game.mp4 --depth quick
 
-# Command Line Analysis
-python scripts/run_analysis.py path/to/video.mp4 --depth standard
+# Standard analysis (balanced)
+python scripts/run_analysis.py path/to/game.mp4 --depth standard
+
+# Deep analysis (most detailed)
+python scripts/run_analysis.py path/to/game.mp4 --depth deep
 ```
 
-## Running in Claude Code
+### Programmatic Usage
 
-This project is designed to work seamlessly with Claude Code. Here's how to set it up:
+```python
+from src.core.video_processor import VideoProcessor
 
-### 1. Clone and Setup
+# Initialize (uses EnhancedDetector by default)
+processor = VideoProcessor()
 
-In Claude Code terminal:
+# Load video
+video_info = processor.load_video("game.mp4")
 
-```bash
-# Navigate to your workspace
-cd /path/to/your/projects
+# Set team colors (optional - auto-detection available)
+processor.team_classifier.set_team_colors(
+    home_color=(255, 255, 0),  # Yellow jerseys
+    away_color=(0, 0, 255)     # Blue jerseys
+)
 
-# Clone or create the project
-git clone https://github.com/yourusername/soccer_film_analysis.git
-cd soccer_film_analysis
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-```
-
-### 2. Install Dependencies
-
-```bash
-# Install all requirements
-pip install -r requirements.txt
-
-# The key packages are:
-pip install supervision ultralytics inference roboflow
-pip install git+https://github.com/roboflow/sports.git
-pip install PyQt6 psycopg2-binary sqlalchemy loguru rich
-```
-
-### 3. Configure Environment
-
-Create `.env` file:
-
-```env
-# Database
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=soccer_analysis
-DB_USER=postgres
-DB_PASSWORD=your_password
-
-# Roboflow API Key (get free at roboflow.com)
-ROBOFLOW_API_KEY=your_api_key
-
-# Settings
-LOG_LEVEL=INFO
-ENABLE_GPU=true
-```
-
-### 4. Setup Database
-
-```bash
-# Make sure PostgreSQL is installed and running
-# On Mac: brew install postgresql && brew services start postgresql
-# On Linux: sudo apt install postgresql && sudo systemctl start postgresql
-# On Windows: Download from postgresql.org
-
-# Create the database
-python scripts/setup_database.py
-```
-
-### 5. Run Analysis
-
-```bash
-# GUI Mode
-python -m src.gui.main_window
-
-# CLI Mode
-python scripts/run_analysis.py data/videos/game.mp4 --depth standard
-
-# Quick test with sample frames
-python scripts/run_analysis.py game.mp4 --depth quick --start 0 --end 1000
-```
-
-### 6. Push to GitHub
-
-```bash
-# Initialize git if not already done
-git init
-
-# Add remote
-git remote add origin https://github.com/yourusername/soccer_film_analysis.git
-
-# Commit and push
-git add .
-git commit -m "Initial commit: Soccer film analysis app"
-git push -u origin main
+# Process with progress callback
+result = processor.process_video(
+    progress_callback=lambda p: print(f"Progress: {p.percentage:.1f}%")
+)
 ```
 
 ## Project Structure
@@ -192,140 +158,141 @@ git push -u origin main
 ```
 soccer_film_analysis/
 ├── config/
-│   ├── __init__.py
-│   └── settings.py          # Pydantic settings management
+│   └── settings.py              # Pydantic settings management
 ├── src/
 │   ├── core/
-│   │   └── video_processor.py    # Main processing pipeline
+│   │   └── video_processor.py   # Main processing pipeline
 │   ├── detection/
-│   │   └── detector.py           # Roboflow Sports integration
-│   ├── tracking/                 # Object tracking
-│   ├── analytics/                # Event detection & metrics
-│   ├── visualization/            # Overlays & heatmaps
-│   ├── database/
-│   │   └── models.py             # SQLAlchemy models
+│   │   ├── detector.py          # Base YOLO detection
+│   │   ├── enhanced_detector.py # Improved detection with filtering
+│   │   └── pitch_detector.py    # Pitch boundary detection
+│   ├── analysis/
+│   │   ├── tactical_analytics.py    # Pressing, zones, set pieces
+│   │   ├── advanced_tactical.py     # xT, duels, fatigue, shape
+│   │   ├── formation_detection.py   # Formation auto-detection
+│   │   ├── expected_goals.py        # xG model
+│   │   ├── space_analysis.py        # Space creation, third-man runs
+│   │   └── pdf_report.py            # PDF report generation
+│   ├── data/
+│   │   ├── team_database.py     # PostgreSQL team/player database
+│   │   └── cloud_sync.py        # Cloud backup functionality
+│   ├── processing/
+│   │   └── video_cache.py       # Video preprocessing cache
 │   ├── gui/
-│   │   └── main_window.py        # PyQt6 interface
-│   └── reports/                  # Report generation
+│   │   ├── main_window.py       # Main PyQt6 interface
+│   │   └── stats_widget.py      # Real-time statistics panel
+│   └── database/
+│       └── models.py            # SQLAlchemy ORM models
 ├── scripts/
-│   ├── setup_database.py         # Database initialization
-│   └── run_analysis.py           # CLI analysis tool
-├── tests/                        # Unit tests
+│   ├── setup_database.py        # Database initialization
+│   └── run_analysis.py          # CLI analysis tool
 ├── data/
-│   ├── videos/                   # Input videos
-│   ├── outputs/                  # Analysis outputs
-│   └── models/                   # Downloaded models
-├── logs/                         # Application logs
+│   ├── videos/                  # Input videos
+│   └── outputs/                 # Analysis outputs
 ├── requirements.txt
 ├── .env.example
 └── README.md
 ```
 
-## Usage Examples
-
-### Basic Analysis
-
-```python
-from src.core.video_processor import VideoProcessor
-from config import AnalysisDepth
-
-# Initialize
-processor = VideoProcessor()
-
-# Load video
-video_info = processor.load_video("game.mp4")
-
-# Calibrate team colors (or provide manually)
-processor.calibrate_teams()
-
-# Run analysis
-result = processor.process_video(
-    analysis_depth=AnalysisDepth.STANDARD,
-    progress_callback=lambda p: print(f"Progress: {p.percentage:.1f}%")
-)
-```
-
-### With Manual Team Colors
-
-```python
-# If you know the jersey colors
-processor.team_classifier.set_team_colors(
-    home_color=(255, 255, 0),  # Yellow
-    away_color=(0, 0, 255)     # Blue
-)
-```
-
-### Real-time Frame Display
-
-```python
-import cv2
-
-def on_frame(frame, detections):
-    cv2.imshow("Analysis", frame)
-    cv2.waitKey(1)
-
-processor.process_video(
-    analysis_depth=AnalysisDepth.QUICK,
-    frame_callback=on_frame
-)
-```
-
 ## Configuration
 
-All settings can be configured via environment variables or `.env` file:
+Settings via environment variables or `.env` file:
 
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `DB_HOST` | PostgreSQL host | localhost |
 | `DB_PORT` | PostgreSQL port | 5432 |
 | `DB_NAME` | Database name | soccer_analysis |
-| `ROBOFLOW_API_KEY` | Roboflow API key | required |
+| `DB_USER` | Database user | postgres |
+| `DB_PASSWORD` | Database password | (empty) |
 | `LOG_LEVEL` | Logging level | INFO |
 | `ENABLE_GPU` | Use GPU acceleration | true |
 | `PLAYER_CONFIDENCE_THRESHOLD` | Detection confidence | 0.3 |
+| `BALL_CONFIDENCE_THRESHOLD` | Ball detection confidence | 0.15 |
 
-## Analysis Depth Levels
+## Detection Features
 
-| Level | Frame Sample | Processing Time | Features |
-|-------|--------------|-----------------|----------|
-| Quick | 1/10 frames | 5-10 min | Basic detection only |
-| Standard | 1/5 frames | 20-30 min | Detection + events |
-| Deep | 1/2 frames | 45-60 min | Full analytics |
+### Enhanced Detection Pipeline
+
+The `EnhancedDetector` provides several improvements over basic YOLO:
+
+1. **Pitch Boundary Filtering** - Detects the playing field and filters out:
+   - Ball boys
+   - Substitutes on the sideline
+   - Coaches
+   - Spectators near the field
+
+2. **Referee Classification** - Automatically identifies referees by:
+   - Black kit detection
+   - Bright color detection (yellow, pink for assistant refs)
+   - Referees are NOT assigned to home/away teams
+
+3. **Stable Team Assignment** - Uses tracking history to prevent flickering:
+   - Maintains color history per tracked player
+   - Uses majority voting over 30 frames
+   - Players maintain team assignment consistently
+
+4. **Ball Detection Fallback** - When YOLO misses the ball:
+   - Color-based detection for white/orange balls
+   - Position interpolation from recent frames
+   - Works even in crowded scenes
+
+## Analysis Modules
+
+### Formation Detection
+Automatically identifies team formations using template matching:
+- 4-4-2, 4-3-3, 4-2-3-1, 3-5-2, 3-4-3, 5-3-2, 5-4-1, and more
+- Tracks formation changes throughout the match
+- Uses Hungarian algorithm for optimal player-position matching
+
+### Expected Goals (xG)
+Shot quality model considering:
+- Distance and angle to goal
+- Shot type (foot, header)
+- Defensive pressure
+- Goalkeeper positioning
+- Game situation (open play, counter, set piece)
+
+### Space Analysis
+Tracks off-ball movement:
+- Decoy runs, overlap/underlap runs
+- Third-man run pattern detection
+- Space creation quantification
+- Player run classification
 
 ## Troubleshooting
 
 ### Common Issues
 
-**PostgreSQL Connection Failed**
+**Detection not working well**
+- Ensure good video quality (720p+ recommended)
+- Set team colors manually if auto-detection struggles
+- Check that the pitch is clearly visible
+
+**Ball not being detected**
+- Ball detection improves with higher resolution video
+- The fallback color detection helps with white/orange balls
+- Position interpolation fills short gaps
+
+**Players switching teams**
+- The enhanced detector uses tracking history to stabilize assignments
+- Allow a few seconds for the tracker to learn consistent assignments
+- Manually setting team colors helps significantly
+
+**PostgreSQL connection failed**
 ```bash
 # Check PostgreSQL is running
 pg_isready -h localhost -p 5432
 
-# Check credentials in .env
+# Verify credentials in .env file
 ```
 
-**Roboflow Model Not Loading**
+**GPU not detected**
 ```bash
-# Verify API key
-python -c "from inference import get_model; print('OK')"
-
-# Check internet connection
-```
-
-**GUI Not Displaying**
-```bash
-# Make sure PyQt6 is installed correctly
-pip install --force-reinstall PyQt6 PyQt6-Qt6
-
-# On headless servers, use CLI mode instead
-```
-
-**GPU Not Detected**
-```bash
-# Check CUDA installation
+# Check CUDA (NVIDIA)
 python -c "import torch; print(torch.cuda.is_available())"
 
-# For Apple Silicon
+# Check MPS (Apple Silicon)
 python -c "import torch; print(torch.backends.mps.is_available())"
 ```
 
@@ -343,17 +310,24 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Acknowledgments
 
-- [Roboflow Sports](https://github.com/roboflow/sports) - Detection models and utilities
-- [Supervision](https://github.com/roboflow/supervision) - Computer vision utilities
 - [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics) - Object detection
-- [mplsoccer](https://github.com/andrewRowlinson/mplsoccer) - Soccer visualizations
+- [Supervision](https://github.com/roboflow/supervision) - Computer vision utilities and tracking
+- [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) - GUI framework
 
 ## Roadmap
 
+- [x] Local YOLO detection (no API required)
+- [x] Enhanced referee detection
+- [x] Pitch boundary filtering
+- [x] Formation auto-detection
+- [x] Expected Goals (xG) model
+- [x] Space creation analysis
+- [x] Third-man run detection
+- [x] Video preprocessing cache
+- [x] PostgreSQL database
+- [x] PDF report generation
 - [ ] Jersey number OCR recognition
-- [ ] Advanced event detection (tactical fouls, set pieces)
-- [ ] Multi-camera support
-- [ ] Cloud deployment (Azure/GCP)
-- [ ] Mobile companion app API
-- [ ] Custom model fine-tuning
+- [ ] Multi-camera synchronization
+- [ ] Live streaming analysis
+- [ ] Mobile companion app
 - [ ] Season-long player tracking
