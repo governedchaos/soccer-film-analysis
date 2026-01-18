@@ -18,6 +18,7 @@ from src.detection.detector import (
     SoccerDetector, TeamClassifier, PitchTransformer, PossessionCalculator,
     FrameDetections, PlayerDetection, draw_detections
 )
+from src.detection.enhanced_detector import EnhancedDetector
 from src.database.models import (
     Game, Team, Player, TrackingData, Event, PlayerMetrics, 
     TeamMetrics, AnalysisSession, TeamType, AnalysisStatus,
@@ -97,7 +98,8 @@ class VideoProcessor:
             pitch_transformer: PitchTransformer instance
             possession_calculator: PossessionCalculator instance
         """
-        self.detector = detector or SoccerDetector()
+        # Use EnhancedDetector by default for better referee/ball detection
+        self.detector = detector or EnhancedDetector()
         self.team_classifier = team_classifier or TeamClassifier()
         self.pitch_transformer = pitch_transformer or PitchTransformer()
         self.possession_calculator = possession_calculator or PossessionCalculator()
