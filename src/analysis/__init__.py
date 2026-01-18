@@ -59,6 +59,15 @@ from .space_analysis import (
     SpaceType
 )
 
+# Analysis pipeline
+from .pipeline import (
+    AnalysisPipeline,
+    AnalysisPipelineConfig,
+    AnalysisDepthLevel,
+    FrameAnalysisResult,
+    MatchAnalysisSummary
+)
+
 __all__ = [
     "AnalysisExporter",
     "format_timestamp",
@@ -100,4 +109,10 @@ __all__ = [
     "SpaceCalculator",
     "RunType",
     "SpaceType",
+    # Pipeline
+    "AnalysisPipeline",
+    "AnalysisPipelineConfig",
+    "AnalysisDepthLevel",
+    "FrameAnalysisResult",
+    "MatchAnalysisSummary",
 ]

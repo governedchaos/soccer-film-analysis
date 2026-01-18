@@ -20,9 +20,16 @@ from src.detection.detector import (
 )
 from src.detection.enhanced_detector import EnhancedDetector
 from src.database.models import (
-    Game, Team, Player, TrackingData, Event, PlayerMetrics, 
+    Game, Team, Player, TrackingData, Event, PlayerMetrics,
     TeamMetrics, AnalysisSession, TeamType, AnalysisStatus,
     get_db_session
+)
+from src.analysis.pipeline import (
+    AnalysisPipeline,
+    AnalysisPipelineConfig,
+    AnalysisDepthLevel,
+    FrameAnalysisResult,
+    MatchAnalysisSummary
 )
 
 
@@ -115,6 +122,10 @@ class VideoProcessor:
         
         # Results storage
         self.frame_detections: Dict[int, FrameDetections] = {}
+
+        # Analysis pipeline (tactical analysis)
+        self.analysis_pipeline: Optional[AnalysisPipeline] = None
+        self.frame_analysis_results: Dict[int, FrameAnalysisResult] = {}
 
         # Detection statistics tracking
         self._detection_stats = {
@@ -292,11 +303,22 @@ class VideoProcessor:
             f"Frames {start_frame}-{end_frame} | "
             f"Sample rate: 1/{frame_sample_rate}"
         )
-        
+
+        # Initialize analysis pipeline based on depth
+        pipeline_depth = {
+            AnalysisDepth.QUICK: AnalysisDepthLevel.MINIMAL,
+            AnalysisDepth.STANDARD: AnalysisDepthLevel.STANDARD,
+            AnalysisDepth.DEEP: AnalysisDepthLevel.COMPREHENSIVE,
+        }.get(depth, AnalysisDepthLevel.STANDARD)
+
+        pipeline_config = AnalysisPipelineConfig.from_depth(pipeline_depth)
+        self.analysis_pipeline = AnalysisPipeline(pipeline_config)
+        self.frame_analysis_results.clear()
+
         start_time = datetime.now()
         processed_frames = 0
         total_frames_to_process = (end_frame - start_frame) // frame_sample_rate
-        
+
         # Create database records if saving
         session_id = None
         if save_to_db:
@@ -337,6 +359,16 @@ class VideoProcessor:
 
                     # Update detection statistics
                     self._update_detection_stats(detections)
+
+                    # Run tactical analysis pipeline
+                    if self.analysis_pipeline:
+                        try:
+                            analysis_result = self.analysis_pipeline.process_frame(
+                                detections, fps=self.video_info.fps
+                            )
+                            self.frame_analysis_results[frame_num] = analysis_result
+                        except Exception as analysis_error:
+                            logger.debug(f"Analysis pipeline error on frame {frame_num}: {analysis_error}")
 
                     # Store detections
                     self.frame_detections[frame_num] = detections
@@ -396,12 +428,19 @@ class VideoProcessor:
             # Log detection statistics
             self.log_detection_stats()
 
+            # Get analysis pipeline summary
+            analysis_summary = None
+            if self.analysis_pipeline:
+                analysis_summary = self.analysis_pipeline.get_summary()
+                self._log_analysis_summary(analysis_summary)
+
             return {
                 "status": "completed",
                 "processed_frames": processed_frames,
                 "elapsed_seconds": elapsed,
                 "session_id": session_id,
-                "detection_stats": self.get_detection_stats()
+                "detection_stats": self.get_detection_stats(),
+                "analysis_summary": analysis_summary
             }
             
         except Exception as e:
@@ -507,6 +546,42 @@ class VideoProcessor:
             "ball_detection_rate": 0.0,
             "avg_players_per_frame": 0.0,
         }
+
+    def _log_analysis_summary(self, summary: MatchAnalysisSummary):
+        """Log tactical analysis summary"""
+        logger.info("=" * 50)
+        logger.info("TACTICAL ANALYSIS SUMMARY")
+        logger.info("=" * 50)
+        logger.info(f"Possession: Home {summary.possession_home:.1f}% - Away {summary.possession_away:.1f}%")
+
+        if summary.home_primary_formation:
+            logger.info(f"Home formation: {summary.home_primary_formation.value} ({summary.formation_changes_home} changes)")
+        if summary.away_primary_formation:
+            logger.info(f"Away formation: {summary.away_primary_formation.value} ({summary.formation_changes_away} changes)")
+
+        if summary.home_avg_compactness > 0 or summary.away_avg_compactness > 0:
+            logger.info(f"Team compactness: Home {summary.home_avg_compactness:.2f} - Away {summary.away_avg_compactness:.2f}")
+            logger.info(f"Team width: Home {summary.home_avg_width:.1f}m - Away {summary.away_avg_width:.1f}m")
+
+        if summary.home_xg > 0 or summary.away_xg > 0:
+            logger.info(f"xG: Home {summary.home_xg:.2f} ({summary.home_shots} shots) - "
+                       f"Away {summary.away_xg:.2f} ({summary.away_shots} shots)")
+
+        if summary.home_counter_attacks > 0 or summary.away_counter_attacks > 0:
+            logger.info(f"Counter attacks: Home {summary.home_counter_attacks} - Away {summary.away_counter_attacks}")
+
+        logger.info(f"Runs detected: {summary.total_runs_detected}")
+        logger.info("=" * 50)
+
+    def get_analysis_summary(self) -> Optional[MatchAnalysisSummary]:
+        """Get the tactical analysis summary"""
+        if self.analysis_pipeline:
+            return self.analysis_pipeline.get_summary()
+        return None
+
+    def get_frame_analysis(self, frame_number: int) -> Optional[FrameAnalysisResult]:
+        """Get tactical analysis for a specific frame"""
+        return self.frame_analysis_results.get(frame_number)
 
     def iterate_frames(
         self,
