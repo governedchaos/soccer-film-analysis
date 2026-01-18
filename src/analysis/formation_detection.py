@@ -8,9 +8,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any
 from enum import Enum
 from collections import defaultdict
-import logging
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 class FormationType(Enum):
@@ -440,9 +438,14 @@ class FormationDetector:
         if best_match is None or best_match.confidence < 0.3:
             formation_type = FormationType.UNKNOWN
             confidence = 0.0
+            logger.debug(f"Frame {frame}: Formation unknown (confidence too low)")
         else:
             formation_type = best_match.formation_type
             confidence = best_match.confidence
+            logger.debug(
+                f"Frame {frame}: Detected {formation_type.value} "
+                f"(confidence={confidence:.2f}, distance={best_match.avg_distance:.3f})"
+            )
 
         # Store in history for smoothing
         timestamp = frame / 30.0  # Assume 30fps

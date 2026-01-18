@@ -9,9 +9,7 @@ from typing import Optional, List, Dict, Tuple, Set, Any
 from collections import defaultdict
 from enum import Enum
 import math
-import logging
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 class RunType(Enum):
@@ -324,7 +322,7 @@ class MovementTracker:
 
         speed_current, direction, acceleration = self.get_velocity(player_id)
 
-        return PlayerMovement(
+        movement = PlayerMovement(
             player_id=player_id,
             team_id=team_id,
             start_frame=start[0],
@@ -336,6 +334,13 @@ class MovementTracker:
             acceleration=acceleration,
             distance_covered=distance
         )
+
+        logger.debug(
+            f"Run detected: player={player_id}, distance={distance:.1f}m, "
+            f"speed={speed:.1f}m/s, direction={direction:.0f}°"
+        )
+
+        return movement
 
 
 class SpaceCreationAnalyzer:
@@ -356,6 +361,8 @@ class SpaceCreationAnalyzer:
 
         self.space_events: List[SpaceCreated] = []
         self.player_space_created: Dict[int, float] = defaultdict(float)
+
+        logger.debug(f"SpaceCreationAnalyzer initialized: pitch={pitch_length}x{pitch_width}m")
 
     def classify_run_type(
         self,

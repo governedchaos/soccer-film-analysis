@@ -8,9 +8,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any
 from enum import Enum
 import math
-import logging
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 class ShotType(Enum):
@@ -159,6 +157,7 @@ class ExpectedGoalsModel:
         self.pitch_length = pitch_length
         self.pitch_width = pitch_width
         self.goal_center_y = pitch_width / 2
+        logger.debug(f"xG model initialized: pitch={pitch_length}x{pitch_width}m")
 
     def calculate_angle(self, x: float, y: float) -> float:
         """
@@ -277,7 +276,15 @@ class ExpectedGoalsModel:
         )
 
         # Clamp to valid range
-        return min(max(final_xg, 0.01), 0.99)
+        final_xg = min(max(final_xg, 0.01), 0.99)
+
+        logger.debug(
+            f"xG calculated: pos=({context.x:.1f}, {context.y:.1f}), "
+            f"base={base_xg:.3f}, final={final_xg:.3f}, "
+            f"type={context.shot_type.value}, situation={context.situation.value}"
+        )
+
+        return final_xg
 
     def get_xg_breakdown(self, context: ShotContext) -> Dict[str, float]:
         """Get detailed breakdown of xG calculation."""
