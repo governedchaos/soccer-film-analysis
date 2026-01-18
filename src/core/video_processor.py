@@ -55,7 +55,97 @@ class VideoInfo:
         )
 
 
-@dataclass 
+class BatchFrameReader:
+    """
+    Efficiently reads frames in batches for GPU processing.
+
+    Pre-loads a batch of frames from the video so they can be
+    processed together in a single GPU inference call.
+    """
+
+    def __init__(
+        self,
+        cap: cv2.VideoCapture,
+        batch_size: int = 8,
+        frame_sample_rate: int = 1
+    ):
+        """
+        Initialize the batch frame reader.
+
+        Args:
+            cap: OpenCV video capture object
+            batch_size: Number of frames to load per batch
+            frame_sample_rate: Only read every Nth frame
+        """
+        self.cap = cap
+        self.batch_size = batch_size
+        self.frame_sample_rate = frame_sample_rate
+
+    def read_batch(
+        self,
+        start_frame: int,
+        end_frame: int
+    ) -> Tuple[List[np.ndarray], List[int]]:
+        """
+        Read a batch of frames starting from start_frame.
+
+        Args:
+            start_frame: Frame number to start from
+            end_frame: Maximum frame number (exclusive)
+
+        Returns:
+            Tuple of (frames list, frame_numbers list)
+        """
+        frames: List[np.ndarray] = []
+        frame_numbers: List[int] = []
+
+        current_frame = start_frame
+
+        while len(frames) < self.batch_size and current_frame < end_frame:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
+            ret, frame = self.cap.read()
+
+            if ret:
+                frames.append(frame)
+                frame_numbers.append(current_frame)
+            else:
+                logger.warning(f"Failed to read frame {current_frame}")
+
+            current_frame += self.frame_sample_rate
+
+        return frames, frame_numbers
+
+    def iterate_batches(
+        self,
+        start_frame: int,
+        end_frame: int
+    ) -> Generator[Tuple[List[np.ndarray], List[int]], None, None]:
+        """
+        Generator that yields batches of frames.
+
+        Args:
+            start_frame: Starting frame number
+            end_frame: Ending frame number (exclusive)
+
+        Yields:
+            Tuple of (frames list, frame_numbers list)
+        """
+        current_frame = start_frame
+
+        while current_frame < end_frame:
+            frames, frame_numbers = self.read_batch(current_frame, end_frame)
+
+            if not frames:
+                break
+
+            yield frames, frame_numbers
+
+            # Move to next batch
+            if frame_numbers:
+                current_frame = frame_numbers[-1] + self.frame_sample_rate
+
+
+@dataclass
 class AnalysisProgress:
     """Progress information for analysis"""
     current_frame: int
@@ -265,11 +355,12 @@ class VideoProcessor:
         progress_callback: Optional[Callable[[AnalysisProgress], None]] = None,
         frame_callback: Optional[Callable[[np.ndarray, FrameDetections], None]] = None,
         save_to_db: bool = True,
-        game_id: Optional[int] = None
+        game_id: Optional[int] = None,
+        batch_size: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Process the loaded video through the analysis pipeline.
-        
+
         Args:
             analysis_depth: Analysis depth level (quick/standard/deep)
             start_frame: Frame to start processing from
@@ -278,30 +369,45 @@ class VideoProcessor:
             frame_callback: Function called with each processed frame and detections
             save_to_db: Whether to save results to database
             game_id: Existing game ID to update (creates new if None)
-            
+            batch_size: Frames per batch for GPU processing (auto-detected if None)
+
         Returns:
             Dict with analysis results summary
         """
         if self._cap is None:
             raise RuntimeError("No video loaded. Call load_video() first.")
-        
+
         if self._is_processing:
             raise RuntimeError("Analysis already in progress")
-        
+
         self._is_processing = True
         self._should_stop = False
         self._progress_callback = progress_callback
         self._frame_callback = frame_callback
-        
+
         # Set parameters
         depth = analysis_depth or settings.default_analysis_depth
         frame_sample_rate = settings.get_frame_sample_rate(depth)
         end_frame = end_frame or self.video_info.total_frames
-        
+
+        # Determine if we should use batch processing (GPU only)
+        device_info = settings.get_device_info()
+        use_batch_processing = device_info['cuda_available'] or device_info['mps_available']
+
+        # Set batch size based on available memory and device
+        if batch_size is None:
+            if device_info['cuda_available']:
+                batch_size = 16  # Good default for most GPUs
+            elif device_info['mps_available']:
+                batch_size = 8   # Apple Silicon - more conservative
+            else:
+                batch_size = 1   # CPU - no benefit from batching
+
         logger.info(
             f"Starting {depth.value} analysis | "
             f"Frames {start_frame}-{end_frame} | "
-            f"Sample rate: 1/{frame_sample_rate}"
+            f"Sample rate: 1/{frame_sample_rate} | "
+            f"Batch size: {batch_size if use_batch_processing else 'N/A (CPU)'}"
         )
 
         # Initialize analysis pipeline based on depth
@@ -323,95 +429,34 @@ class VideoProcessor:
         session_id = None
         if save_to_db:
             session_id = self._create_analysis_session(depth, start_frame, end_frame, game_id)
-        
+
         try:
-            # Position video at start frame
-            self._cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
             self._current_frame = start_frame
-            
-            # Main processing loop
-            for frame_num in range(start_frame, end_frame, frame_sample_rate):
-                if self._should_stop:
-                    logger.info("Analysis stopped by user")
-                    break
-                
-                # Read frame
-                self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                ret, frame = self._cap.read()
-                
-                if not ret:
-                    logger.warning(f"Failed to read frame {frame_num}")
-                    continue
-                
-                # Run detection with error handling
-                try:
-                    detections = self.detector.detect_frame(
-                        frame, frame_num, self.video_info.fps,
-                        detect_pitch=False, track_objects=True
-                    )
 
-                    # Classify teams
-                    self.team_classifier.classify_players(detections.players)
-                    self.team_classifier.classify_players(detections.goalkeepers)
+            if use_batch_processing and batch_size > 1:
+                # GPU batch processing path
+                processed_frames = self._process_video_batched(
+                    start_frame=start_frame,
+                    end_frame=end_frame,
+                    frame_sample_rate=frame_sample_rate,
+                    batch_size=batch_size,
+                    start_time=start_time,
+                    total_frames_to_process=total_frames_to_process,
+                    save_to_db=save_to_db,
+                    session_id=session_id
+                )
+            else:
+                # CPU single-frame processing path
+                processed_frames = self._process_video_sequential(
+                    start_frame=start_frame,
+                    end_frame=end_frame,
+                    frame_sample_rate=frame_sample_rate,
+                    start_time=start_time,
+                    total_frames_to_process=total_frames_to_process,
+                    save_to_db=save_to_db,
+                    session_id=session_id
+                )
 
-                    # Calculate possession
-                    self.possession_calculator.calculate_possession(detections)
-
-                    # Update detection statistics
-                    self._update_detection_stats(detections)
-
-                    # Run tactical analysis pipeline
-                    if self.analysis_pipeline:
-                        try:
-                            analysis_result = self.analysis_pipeline.process_frame(
-                                detections, fps=self.video_info.fps
-                            )
-                            self.frame_analysis_results[frame_num] = analysis_result
-                        except Exception as analysis_error:
-                            logger.debug(f"Analysis pipeline error on frame {frame_num}: {analysis_error}")
-
-                    # Store detections
-                    self.frame_detections[frame_num] = detections
-                except Exception as detection_error:
-                    logger.warning(f"Detection failed on frame {frame_num}: {detection_error}")
-                    # Create empty detections to continue
-                    detections = FrameDetections(
-                        frame_number=frame_num,
-                        timestamp_seconds=frame_num / self.video_info.fps
-                    )
-                    self.frame_detections[frame_num] = detections
-                
-                # Save to database
-                if save_to_db and session_id:
-                    self._save_frame_data(session_id, detections)
-                
-                # Callbacks
-                if self._frame_callback:
-                    annotated_frame = draw_detections(frame, detections)
-                    self._frame_callback(annotated_frame, detections)
-                
-                processed_frames += 1
-                self._current_frame = frame_num
-                
-                # Progress update
-                if self._progress_callback:
-                    elapsed = (datetime.now() - start_time).total_seconds()
-                    fps = processed_frames / max(elapsed, 0.001)
-                    remaining_frames = total_frames_to_process - processed_frames
-                    eta = remaining_frames / max(fps, 0.001)
-                    
-                    progress = AnalysisProgress(
-                        current_frame=frame_num,
-                        total_frames=end_frame,
-                        percentage=(frame_num - start_frame) / (end_frame - start_frame) * 100,
-                        elapsed_seconds=elapsed,
-                        estimated_remaining_seconds=eta,
-                        frames_per_second=fps,
-                        status="processing",
-                        current_phase="detection"
-                    )
-                    self._progress_callback(progress)
-            
             # Analysis complete
             elapsed = (datetime.now() - start_time).total_seconds()
             
@@ -456,7 +501,255 @@ class VideoProcessor:
         """Stop the current analysis"""
         self._should_stop = True
         logger.info("Stop requested")
-    
+
+    def _process_video_sequential(
+        self,
+        start_frame: int,
+        end_frame: int,
+        frame_sample_rate: int,
+        start_time: datetime,
+        total_frames_to_process: int,
+        save_to_db: bool,
+        session_id: Optional[int]
+    ) -> int:
+        """
+        Process video frames one at a time (CPU mode).
+
+        Args:
+            start_frame: Starting frame number
+            end_frame: Ending frame number
+            frame_sample_rate: Process every Nth frame
+            start_time: When processing started
+            total_frames_to_process: Total frames to process
+            save_to_db: Whether to save to database
+            session_id: Database session ID
+
+        Returns:
+            Number of frames processed
+        """
+        processed_frames = 0
+
+        for frame_num in range(start_frame, end_frame, frame_sample_rate):
+            if self._should_stop:
+                logger.info("Analysis stopped by user")
+                break
+
+            # Read frame
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = self._cap.read()
+
+            if not ret:
+                logger.warning(f"Failed to read frame {frame_num}")
+                continue
+
+            # Process single frame
+            detections = self._process_single_frame(frame, frame_num)
+
+            # Save to database
+            if save_to_db and session_id:
+                self._save_frame_data(session_id, detections)
+
+            # Frame callback
+            if self._frame_callback:
+                annotated_frame = draw_detections(frame, detections)
+                self._frame_callback(annotated_frame, detections)
+
+            processed_frames += 1
+            self._current_frame = frame_num
+
+            # Progress update
+            self._report_progress(
+                frame_num, start_frame, end_frame,
+                processed_frames, total_frames_to_process, start_time
+            )
+
+        return processed_frames
+
+    def _process_video_batched(
+        self,
+        start_frame: int,
+        end_frame: int,
+        frame_sample_rate: int,
+        batch_size: int,
+        start_time: datetime,
+        total_frames_to_process: int,
+        save_to_db: bool,
+        session_id: Optional[int]
+    ) -> int:
+        """
+        Process video frames in batches for GPU efficiency.
+
+        Uses batch YOLO inference for better GPU utilization.
+
+        Args:
+            start_frame: Starting frame number
+            end_frame: Ending frame number
+            frame_sample_rate: Process every Nth frame
+            batch_size: Number of frames per batch
+            start_time: When processing started
+            total_frames_to_process: Total frames to process
+            save_to_db: Whether to save to database
+            session_id: Database session ID
+
+        Returns:
+            Number of frames processed
+        """
+        processed_frames = 0
+        batch_reader = BatchFrameReader(self._cap, batch_size, frame_sample_rate)
+
+        logger.info(f"Using GPU batch processing (batch_size={batch_size})")
+
+        for frames, frame_numbers in batch_reader.iterate_batches(start_frame, end_frame):
+            if self._should_stop:
+                logger.info("Analysis stopped by user")
+                break
+
+            # Run batch detection
+            try:
+                detections_list = self.detector.detect_batch(
+                    frames, frame_numbers, self.video_info.fps,
+                    detect_pitch=False, track_objects=True
+                )
+            except Exception as e:
+                logger.error(f"Batch detection failed: {e}")
+                # Fallback to sequential processing for this batch
+                detections_list = []
+                for frame, frame_num in zip(frames, frame_numbers):
+                    det = self.detector.detect_frame(
+                        frame, frame_num, self.video_info.fps,
+                        detect_pitch=False, track_objects=True
+                    )
+                    detections_list.append(det)
+
+            # Process each frame's results (team classification, etc.)
+            for frame, frame_num, detections in zip(frames, frame_numbers, detections_list):
+                # Classify teams
+                self.team_classifier.classify_players(detections.players)
+                self.team_classifier.classify_players(detections.goalkeepers)
+
+                # Calculate possession
+                self.possession_calculator.calculate_possession(detections)
+
+                # Update detection statistics
+                self._update_detection_stats(detections)
+
+                # Run tactical analysis pipeline
+                if self.analysis_pipeline:
+                    try:
+                        analysis_result = self.analysis_pipeline.process_frame(
+                            detections, fps=self.video_info.fps
+                        )
+                        self.frame_analysis_results[frame_num] = analysis_result
+                    except Exception as analysis_error:
+                        logger.debug(f"Analysis pipeline error on frame {frame_num}: {analysis_error}")
+
+                # Store detections
+                self.frame_detections[frame_num] = detections
+
+                # Save to database
+                if save_to_db and session_id:
+                    self._save_frame_data(session_id, detections)
+
+                # Frame callback
+                if self._frame_callback:
+                    annotated_frame = draw_detections(frame, detections)
+                    self._frame_callback(annotated_frame, detections)
+
+                processed_frames += 1
+                self._current_frame = frame_num
+
+            # Progress update (once per batch)
+            if frame_numbers:
+                self._report_progress(
+                    frame_numbers[-1], start_frame, end_frame,
+                    processed_frames, total_frames_to_process, start_time
+                )
+
+        return processed_frames
+
+    def _process_single_frame(
+        self,
+        frame: np.ndarray,
+        frame_num: int
+    ) -> FrameDetections:
+        """
+        Process a single frame through detection and analysis.
+
+        Args:
+            frame: BGR image
+            frame_num: Frame number
+
+        Returns:
+            FrameDetections for this frame
+        """
+        try:
+            detections = self.detector.detect_frame(
+                frame, frame_num, self.video_info.fps,
+                detect_pitch=False, track_objects=True
+            )
+
+            # Classify teams
+            self.team_classifier.classify_players(detections.players)
+            self.team_classifier.classify_players(detections.goalkeepers)
+
+            # Calculate possession
+            self.possession_calculator.calculate_possession(detections)
+
+            # Update detection statistics
+            self._update_detection_stats(detections)
+
+            # Run tactical analysis pipeline
+            if self.analysis_pipeline:
+                try:
+                    analysis_result = self.analysis_pipeline.process_frame(
+                        detections, fps=self.video_info.fps
+                    )
+                    self.frame_analysis_results[frame_num] = analysis_result
+                except Exception as analysis_error:
+                    logger.debug(f"Analysis pipeline error on frame {frame_num}: {analysis_error}")
+
+            # Store detections
+            self.frame_detections[frame_num] = detections
+            return detections
+
+        except Exception as detection_error:
+            logger.warning(f"Detection failed on frame {frame_num}: {detection_error}")
+            # Create empty detections to continue
+            detections = FrameDetections(
+                frame_number=frame_num,
+                timestamp_seconds=frame_num / self.video_info.fps
+            )
+            self.frame_detections[frame_num] = detections
+            return detections
+
+    def _report_progress(
+        self,
+        frame_num: int,
+        start_frame: int,
+        end_frame: int,
+        processed_frames: int,
+        total_frames_to_process: int,
+        start_time: datetime
+    ):
+        """Report progress to callback if registered."""
+        if self._progress_callback:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            fps = processed_frames / max(elapsed, 0.001)
+            remaining_frames = total_frames_to_process - processed_frames
+            eta = remaining_frames / max(fps, 0.001)
+
+            progress = AnalysisProgress(
+                current_frame=frame_num,
+                total_frames=end_frame,
+                percentage=(frame_num - start_frame) / max(end_frame - start_frame, 1) * 100,
+                elapsed_seconds=elapsed,
+                estimated_remaining_seconds=eta,
+                frames_per_second=fps,
+                status="processing",
+                current_phase="detection"
+            )
+            self._progress_callback(progress)
+
     def get_frame(self, frame_number: int) -> Optional[np.ndarray]:
         """Get a specific frame from the video"""
         if self._cap is None:

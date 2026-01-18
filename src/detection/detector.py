@@ -586,6 +586,94 @@ class SoccerDetector:
             logger.debug(f"Color extraction failed: {e}")
             return None
     
+    def detect_batch(
+        self,
+        frames: List[np.ndarray],
+        frame_numbers: List[int],
+        fps: float = 30.0,
+        detect_pitch: bool = False,
+        track_objects: bool = True,
+        confidence_threshold: Optional[float] = None
+    ) -> List[FrameDetections]:
+        """
+        Run detection on a batch of frames using GPU parallelism.
+
+        More efficient than calling detect_frame repeatedly when using GPU,
+        as it processes all frames in a single YOLO inference call.
+
+        Args:
+            frames: List of BGR images as numpy arrays
+            frame_numbers: Corresponding frame numbers
+            fps: Video frames per second
+            detect_pitch: Whether to detect pitch keypoints
+            track_objects: Whether to apply tracking for persistent IDs
+            confidence_threshold: Override default confidence threshold
+
+        Returns:
+            List of FrameDetections objects, one per input frame
+        """
+        if len(frames) == 0:
+            return []
+
+        if len(frames) != len(frame_numbers):
+            raise ValueError("frames and frame_numbers must have same length")
+
+        player_conf = confidence_threshold or settings.player_confidence_threshold
+        ball_conf = settings.ball_confidence_threshold
+        min_conf = min(player_conf, ball_conf, 0.15)
+
+        # Initialize results list
+        results_list: List[FrameDetections] = []
+
+        try:
+            # Run batch YOLO inference - much more efficient on GPU
+            yolo_results_batch = self.model.predict(
+                frames,
+                conf=min_conf,
+                verbose=False,
+                classes=[self.COCO_PERSON, self.COCO_SPORTS_BALL]
+            )
+
+            # Process each frame's results
+            for i, (frame, frame_num, yolo_results) in enumerate(
+                zip(frames, frame_numbers, yolo_results_batch)
+            ):
+                timestamp = frame_num / fps
+                frame_detections = FrameDetections(
+                    frame_number=frame_num,
+                    timestamp_seconds=timestamp
+                )
+
+                if SUPERVISION_AVAILABLE:
+                    detections = sv.Detections.from_ultralytics(yolo_results)
+
+                    # Apply tracking if enabled (must be done sequentially)
+                    if track_objects and len(detections) > 0 and self.tracker is not None:
+                        detections = self.tracker.update_with_detections(detections)
+
+                    frame_detections.raw_detections = detections
+                    self._parse_yolo_detections(frame, detections, frame_detections)
+                else:
+                    self._parse_yolo_results_direct(frame, yolo_results, frame_detections)
+
+                results_list.append(frame_detections)
+
+            logger.debug(f"Batch detection completed: {len(frames)} frames")
+
+        except Exception as e:
+            logger.error(f"Batch detection failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+            # Fallback: return empty detections for each frame
+            for frame_num in frame_numbers:
+                results_list.append(FrameDetections(
+                    frame_number=frame_num,
+                    timestamp_seconds=frame_num / fps
+                ))
+
+        return results_list
+
     def reset_tracker(self):
         """Reset the object tracker (call between videos)"""
         self._tracker = None
