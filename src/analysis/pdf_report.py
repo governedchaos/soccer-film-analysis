@@ -29,6 +29,12 @@ except ImportError:
     REPORTLAB_AVAILABLE = False
     logger.warning("ReportLab not installed. PDF generation will be unavailable.")
 
+    # Stub classes for when ReportLab is not available
+    class Flowable:
+        """Stub Flowable class when ReportLab not installed."""
+        def __init__(self, *args, **kwargs):
+            pass
+
 try:
     import matplotlib.pyplot as plt
     import matplotlib

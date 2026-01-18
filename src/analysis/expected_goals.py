@@ -111,11 +111,15 @@ class ExpectedGoalsModel:
     GOAL_HEIGHT = 2.44  # meters
 
     # Base xG coefficients (calibrated from historical patterns)
+    # Adjusted to produce realistic xG values:
+    # - 6m central: ~0.35-0.40
+    # - 11m (penalty spot): ~0.15-0.20
+    # - 20m central: ~0.05-0.08
     COEFFICIENTS = {
-        'intercept': -3.5,
-        'distance': -0.12,
-        'angle': 0.8,
-        'angle_squared': -0.3,
+        'intercept': -0.8,
+        'distance': -0.09,
+        'angle': 1.2,
+        'angle_squared': -0.4,
         'header': -0.5,
         'weak_foot': -0.2,
         'under_pressure': -0.3,

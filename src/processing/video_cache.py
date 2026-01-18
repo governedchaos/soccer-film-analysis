@@ -191,6 +191,9 @@ class VideoCacheManager:
 
     def get_cache_status(self, video_path: str) -> CacheStatus:
         """Get caching status for a video."""
+        if not Path(video_path).exists():
+            return CacheStatus.NOT_CACHED
+
         video_hash = self._get_video_hash(video_path)
 
         with self._lock:
