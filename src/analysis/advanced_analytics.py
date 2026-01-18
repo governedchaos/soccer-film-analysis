@@ -443,8 +443,9 @@ class FormationDetector:
         if not samples:
             return []
 
-        # Use clustering to find consistent positions
+        # Use clustering to find consistent positions (sklearn version compatible)
         from sklearn.cluster import KMeans
+        import sklearn
 
         all_positions = []
         for sample in samples:
@@ -454,7 +455,11 @@ class FormationDetector:
             return []
 
         # Cluster into 11 positions
-        kmeans = KMeans(n_clusters=11, n_init=10, random_state=42)
+        sklearn_version = tuple(map(int, sklearn.__version__.split('.')[:2]))
+        if sklearn_version >= (1, 2):
+            kmeans = KMeans(n_clusters=11, n_init=10, random_state=42, algorithm='lloyd')
+        else:
+            kmeans = KMeans(n_clusters=11, n_init=10, random_state=42)
         kmeans.fit(all_positions)
 
         return [tuple(c) for c in kmeans.cluster_centers_]

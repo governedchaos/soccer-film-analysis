@@ -139,13 +139,20 @@ class EnhancedDetector(SoccerDetector):
 
     def _init_referee_colors(self):
         """Initialize with common referee colors."""
-        # Typical referee: black outfit
-        self.auto_referee_colors = [
-            (30, 30, 30),     # Black
-            (50, 50, 50),     # Dark gray
-            (255, 230, 0),    # Bright yellow (some leagues)
-            (255, 100, 150),  # Bright pink (some leagues)
-        ]
+        # Start with empty - let manual colors or learning populate this
+        # DO NOT add generic dark colors like black/gray - they match shadows
+        self.auto_referee_colors = []
+
+    def set_referee_colors(self, colors: List[Tuple[int, int, int]]):
+        """
+        Override to clear auto-detected colors when manual colors are set.
+        This ensures only the user-specified colors are used.
+        """
+        # Call parent method
+        super().set_referee_colors(colors)
+        # Clear auto-detected colors - use only manual colors
+        self.auto_referee_colors = []
+        logger.info(f"Cleared auto-detected referee colors, using manual: {colors}")
 
     def detect_frame(
         self,
@@ -273,26 +280,21 @@ class EnhancedDetector(SoccerDetector):
         ref_colors: List[Tuple[int, int, int]]
     ) -> bool:
         """Check if a color matches referee patterns."""
+        # Only match if we have specific referee colors set
+        if not ref_colors:
+            return False
+
         r, g, b = color
 
-        # Check against known referee colors
+        # Check against known referee colors with TIGHT threshold
+        # Only match if very close to a known referee color
         for ref_color in ref_colors:
             distance = self._color_distance(color, ref_color)
-            if distance < 80:  # Close match
+            if distance < 50:  # Tight match - must be close to actual ref color
                 return True
 
-        # Heuristic: Very dark colors (black kit)
-        if r < 60 and g < 60 and b < 60:
-            return True
-
-        # Heuristic: Very bright/saturated colors unlike typical jerseys
-        # Bright yellow-green often worn by refs
-        if g > 200 and r > 200 and b < 100:
-            return True
-
-        # Bright pink/magenta
-        if r > 200 and b > 150 and g < 150:
-            return True
+        # DO NOT use heuristics for dark colors - they match shadows/skin tones
+        # Only use explicit referee colors set by user or detected from actual refs
 
         return False
 
@@ -534,11 +536,17 @@ class EnhancedDetector(SoccerDetector):
         if len(filtered_colors) < 4:
             return None, None
 
-        # Cluster into 2 teams
+        # Cluster into 2 teams (sklearn version compatible)
         from sklearn.cluster import KMeans
+        import sklearn
 
         color_array = np.array(filtered_colors)
-        kmeans = KMeans(n_clusters=2, n_init=10, random_state=42)
+
+        sklearn_version = tuple(map(int, sklearn.__version__.split('.')[:2]))
+        if sklearn_version >= (1, 2):
+            kmeans = KMeans(n_clusters=2, n_init=10, random_state=42, algorithm='lloyd')
+        else:
+            kmeans = KMeans(n_clusters=2, n_init=10, random_state=42)
         kmeans.fit(color_array)
 
         team_colors = kmeans.cluster_centers_.astype(int)

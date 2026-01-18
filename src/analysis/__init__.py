@@ -68,6 +68,39 @@ from .pipeline import (
     MatchAnalysisSummary
 )
 
+# Advanced analytics (heatmaps, pass networks, shots, speed)
+from .advanced_analytics import (
+    HeatmapGenerator,
+    PassNetworkAnalyzer,
+    ShotDetector,
+    SpeedDistanceTracker,
+    PossessionSequenceTracker,
+    OffsideLine,
+    PlayerPosition,
+    PassEvent,
+    ShotEvent,
+    PossessionSequence
+)
+
+# Auto-save functionality
+from .auto_save import (
+    AutoSaveManager,
+    AnalysisStateManager
+)
+
+# Game comparison
+from .game_comparison import (
+    GameStats,
+    GameComparisonAnalyzer
+)
+
+# Game period detection
+from .game_periods import (
+    GamePeriod,
+    PeriodMarker,
+    GamePeriodDetector
+)
+
 __all__ = [
     "AnalysisExporter",
     "format_timestamp",
@@ -115,4 +148,25 @@ __all__ = [
     "AnalysisDepthLevel",
     "FrameAnalysisResult",
     "MatchAnalysisSummary",
+    # Advanced analytics
+    "HeatmapGenerator",
+    "PassNetworkAnalyzer",
+    "ShotDetector",
+    "SpeedDistanceTracker",
+    "PossessionSequenceTracker",
+    "OffsideLine",
+    "PlayerPosition",
+    "PassEvent",
+    "ShotEvent",
+    "PossessionSequence",
+    # Auto-save
+    "AutoSaveManager",
+    "AnalysisStateManager",
+    # Game comparison
+    "GameStats",
+    "GameComparisonAnalyzer",
+    # Game periods
+    "GamePeriod",
+    "PeriodMarker",
+    "GamePeriodDetector",
 ]

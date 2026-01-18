@@ -285,6 +285,11 @@ class ControlPanel(QGroupBox):
         self.progress_bar.setValue(int(progress.percentage))
         self.progress_label.setText(str(progress))
 
+    def update_progress_simple(self, current_frame: int, total_frames: int, percentage: float):
+        """Update progress bar and label with simple values"""
+        self.progress_bar.setValue(int(percentage))
+        self.progress_label.setText(f"Frame {current_frame}/{total_frames} ({percentage:.1f}%)")
+
     def set_analyzing(self, analyzing: bool):
         """Update UI state for analysis"""
         self.analyze_btn.setEnabled(not analyzing)

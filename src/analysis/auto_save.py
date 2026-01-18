@@ -81,12 +81,13 @@ class AutoSaveManager:
         finally:
             self._schedule_save()
 
-    def save_state(self, state: Dict[str, Any]) -> Path:
+    def save_state(self, state: Dict[str, Any], video_path: Optional[str] = None) -> Path:
         """
         Save current state to file.
 
         Args:
             state: State dictionary to save
+            video_path: Optional path to the video being analyzed
 
         Returns:
             Path to saved file
@@ -98,7 +99,8 @@ class AutoSaveManager:
         # Add metadata
         state['_autosave_metadata'] = {
             'timestamp': datetime.now().isoformat(),
-            'version': '1.0'
+            'version': '1.0',
+            'video_path': video_path
         }
 
         # Save as JSON for readability
@@ -171,6 +173,19 @@ class AutoSaveManager:
     def get_last_save_time(self) -> Optional[datetime]:
         """Get time of last save"""
         return self._last_save_time
+
+    def should_auto_save(self) -> bool:
+        """
+        Check if enough time has passed since last save to trigger a new save.
+
+        Returns:
+            True if should save, False otherwise
+        """
+        if self._last_save_time is None:
+            return True
+
+        elapsed = (datetime.now() - self._last_save_time).total_seconds()
+        return elapsed >= self.interval
 
 
 class AnalysisStateManager:

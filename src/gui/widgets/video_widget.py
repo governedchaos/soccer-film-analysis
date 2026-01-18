@@ -7,6 +7,7 @@ import numpy as np
 from PyQt6.QtWidgets import QLabel, QSizePolicy
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QImage, QPixmap
+from loguru import logger
 
 
 class VideoWidget(QLabel):
@@ -37,28 +38,47 @@ class VideoWidget(QLabel):
         Args:
             frame: BGR numpy array
         """
-        if frame is None:
-            return
+        try:
+            logger.debug(f"[VIDEO_WIDGET] display_frame called")
+            if frame is None:
+                logger.debug(f"[VIDEO_WIDGET] Frame is None, returning")
+                return
 
-        # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_frame.shape
+            logger.debug(f"[VIDEO_WIDGET] Frame shape: {frame.shape}, dtype: {frame.dtype}")
 
-        # Scale to fit widget while maintaining aspect ratio
-        widget_w, widget_h = self.width(), self.height()
-        scale = min(widget_w / w, widget_h / h)
-        new_w, new_h = int(w * scale), int(h * scale)
+            # Convert BGR to RGB
+            logger.debug(f"[VIDEO_WIDGET] Converting BGR to RGB...")
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_frame.shape
+            logger.debug(f"[VIDEO_WIDGET] RGB frame: {w}x{h}, channels: {ch}")
 
-        if scale != 1.0:
-            rgb_frame = cv2.resize(rgb_frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            h, w = new_h, new_w
+            # Scale to fit widget while maintaining aspect ratio
+            widget_w, widget_h = self.width(), self.height()
+            scale = min(widget_w / w, widget_h / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            logger.debug(f"[VIDEO_WIDGET] Scaling: widget={widget_w}x{widget_h}, scale={scale:.3f}, new={new_w}x{new_h}")
 
-        # Convert to QImage
-        bytes_per_line = ch * w
-        qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            if scale != 1.0:
+                logger.debug(f"[VIDEO_WIDGET] Resizing frame...")
+                rgb_frame = cv2.resize(rgb_frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                h, w = new_h, new_w
+                logger.debug(f"[VIDEO_WIDGET] Resized to {w}x{h}")
 
-        # Display
-        self.setPixmap(QPixmap.fromImage(qt_image))
+            # Convert to QImage - MUST use copy() to avoid crash when numpy array is garbage collected
+            bytes_per_line = ch * w
+            logger.debug(f"[VIDEO_WIDGET] Creating QImage: {w}x{h}, bytes_per_line={bytes_per_line}")
+            qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
+            logger.debug(f"[VIDEO_WIDGET] QImage created, size: {qt_image.width()}x{qt_image.height()}")
+
+            # Display
+            logger.debug(f"[VIDEO_WIDGET] Setting pixmap...")
+            self.setPixmap(QPixmap.fromImage(qt_image))
+            logger.debug(f"[VIDEO_WIDGET] display_frame completed successfully")
+
+        except Exception as e:
+            logger.error(f"[VIDEO_WIDGET] display_frame CRASHED: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def clear_display(self):
         """Clear the display"""

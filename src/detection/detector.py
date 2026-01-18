@@ -109,6 +109,9 @@ class FrameDetections:
     # Raw supervision detections for advanced processing
     raw_detections: Optional[Any] = None
 
+    # Possession team (0=home, 1=away, None=contested/unknown)
+    possession_team: Optional[int] = None
+
 
 # ============================================
 # Detection Pipeline
@@ -536,10 +539,17 @@ class SoccerDetector:
             height = y2 - y1
 
             # Focus on center of jersey area (avoid edges/background)
-            jersey_y1 = y1 + int(height * 0.15)  # Skip head
-            jersey_y2 = y1 + int(height * 0.45)  # Upper body only
-            jersey_x1 = x1 + int(width * 0.2)    # Avoid edges
-            jersey_x2 = x2 - int(width * 0.2)
+            # For distant players (small bboxes), use larger region
+            if height < 80:  # Small/distant player
+                jersey_y1 = y1 + int(height * 0.20)  # Skip head
+                jersey_y2 = y1 + int(height * 0.55)  # Larger torso region
+                jersey_x1 = x1 + int(width * 0.15)   # Less edge cropping
+                jersey_x2 = x2 - int(width * 0.15)
+            else:  # Normal/close player
+                jersey_y1 = y1 + int(height * 0.18)  # Skip head
+                jersey_y2 = y1 + int(height * 0.50)  # Upper body
+                jersey_x1 = x1 + int(width * 0.20)   # Avoid edges
+                jersey_x2 = x2 - int(width * 0.20)
 
             # Ensure valid coordinates
             jersey_y1 = max(0, min(jersey_y1, frame.shape[0] - 1))
@@ -566,12 +576,20 @@ class SoccerDetector:
                 (roi_hsv[:, :, 1] >= 40)
             )
 
+            # Exclude skin tones (H: 0-25 or 340-360, low-medium S, medium-high V)
+            # In OpenCV HSV, H is 0-180, so skin is roughly H: 0-15 or 170-180
+            skin_mask = (
+                ((roi_hsv[:, :, 0] <= 15) | (roi_hsv[:, :, 0] >= 170)) &
+                (roi_hsv[:, :, 1] >= 20) & (roi_hsv[:, :, 1] <= 150) &
+                (roi_hsv[:, :, 2] >= 50) & (roi_hsv[:, :, 2] <= 230)
+            )
+
             # Also exclude very dark pixels (shadows) and very bright (overexposed)
-            dark_mask = roi_hsv[:, :, 2] < 30
+            dark_mask = roi_hsv[:, :, 2] < 40  # Slightly higher threshold
             bright_mask = roi_hsv[:, :, 2] > 250
 
-            # Combined mask: exclude grass, shadows, and overexposed
-            exclude_mask = grass_mask | dark_mask | bright_mask
+            # Combined mask: exclude grass, skin, shadows, and overexposed
+            exclude_mask = grass_mask | skin_mask | dark_mask | bright_mask
 
             # Get valid pixels
             valid_pixels = roi_rgb[~exclude_mask]
@@ -585,10 +603,19 @@ class SoccerDetector:
             # Use K-means clustering to find dominant color (k=3 to handle variations)
             pixels = valid_pixels.astype(np.float32)
 
-            # K-means with k=3 clusters
+            # K-means with k=3 clusters (sklearn version compatible)
             from sklearn.cluster import KMeans
+            import sklearn
             n_clusters = min(3, len(pixels))
-            kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42, max_iter=50)
+
+            sklearn_version = tuple(map(int, sklearn.__version__.split('.')[:2]))
+            if sklearn_version >= (1, 2):
+                kmeans = KMeans(
+                    n_clusters=n_clusters, n_init=3, random_state=42,
+                    max_iter=50, algorithm='lloyd'
+                )
+            else:
+                kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42, max_iter=50)
             kmeans.fit(pixels)
 
             # Find the largest cluster (most common color)
@@ -728,9 +755,20 @@ class TeamClassifier:
             n_teams: Number of teams (default 2)
         """
         from sklearn.cluster import KMeans
+        import sklearn
 
         self.n_teams = n_teams
-        self.kmeans = KMeans(n_clusters=n_teams, n_init=10, random_state=42)
+
+        # Handle sklearn version compatibility
+        # Newer versions (>=1.2) use 'algorithm' parameter differently
+        sklearn_version = tuple(map(int, sklearn.__version__.split('.')[:2]))
+        if sklearn_version >= (1, 2):
+            self.kmeans = KMeans(
+                n_clusters=n_teams, n_init=10, random_state=42, algorithm='lloyd'
+            )
+        else:
+            self.kmeans = KMeans(n_clusters=n_teams, n_init=10, random_state=42)
+
         self._is_fitted = False
         self._team_colors = None
 
@@ -817,6 +855,11 @@ class TeamClassifier:
             away_color: RGB tuple for away team
         """
         self._team_colors = np.array([home_color, away_color])
+        # Create fake data with exactly the team colors to properly fit the KMeans
+        # This ensures all internal attributes (_n_threads, etc.) are properly initialized
+        fake_data = np.array([home_color, away_color], dtype=np.float64)
+        self.kmeans.fit(fake_data)
+        # Override cluster centers with exact colors
         self.kmeans.cluster_centers_ = self._team_colors.astype(np.float64)
         self._is_fitted = True
         # Clear cache when team colors change

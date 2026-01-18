@@ -13,7 +13,7 @@ import threading
 import queue
 from loguru import logger
 
-from config import settings, AnalysisDepth
+from config import settings, AnalysisDepth, gpu_memory_manager
 from src.detection.detector import (
     SoccerDetector, TeamClassifier, PitchTransformer, PossessionCalculator,
     FrameDetections, PlayerDetection, draw_detections
@@ -31,6 +31,15 @@ from src.analysis.pipeline import (
     FrameAnalysisResult,
     MatchAnalysisSummary
 )
+from src.analysis.advanced_analytics import (
+    HeatmapGenerator,
+    SpeedDistanceTracker,
+    PassNetworkAnalyzer,
+    ShotDetector,
+    PossessionSequenceTracker
+)
+from src.analysis.game_periods import GamePeriodDetector, GamePeriod
+from src.detection.tracking_persistence import IDStabilizer
 
 
 @dataclass
@@ -200,22 +209,36 @@ class VideoProcessor:
         self.team_classifier = team_classifier or TeamClassifier()
         self.pitch_transformer = pitch_transformer or PitchTransformer()
         self.possession_calculator = possession_calculator or PossessionCalculator()
-        
+
         # Video info
         self.video_info: Optional[VideoInfo] = None
         self._cap: Optional[cv2.VideoCapture] = None
-        
+
         # Analysis state
         self._is_processing = False
         self._should_stop = False
         self._current_frame = 0
-        
+
         # Results storage
         self.frame_detections: Dict[int, FrameDetections] = {}
 
         # Analysis pipeline (tactical analysis)
         self.analysis_pipeline: Optional[AnalysisPipeline] = None
         self.frame_analysis_results: Dict[int, FrameAnalysisResult] = {}
+
+        # Advanced analytics modules
+        self.heatmap_generator: Optional[HeatmapGenerator] = None
+        self.speed_tracker: Optional[SpeedDistanceTracker] = None
+        self.pass_network_analyzer: Optional[PassNetworkAnalyzer] = None
+        self.shot_detector: Optional[ShotDetector] = None
+        self.possession_sequence_tracker: Optional[PossessionSequenceTracker] = None
+
+        # Game period detection
+        self.game_period_detector: Optional[GamePeriodDetector] = None
+        self.detected_periods: List[GamePeriod] = []
+
+        # ID stabilization for consistent tracking
+        self.id_stabilizer: Optional[IDStabilizer] = None
 
         # Detection statistics tracking
         self._detection_stats = {
@@ -397,12 +420,21 @@ class VideoProcessor:
 
         # Set batch size based on available memory and device
         if batch_size is None:
-            if device_info['cuda_available']:
+            if settings.auto_adjust_batch_size and (device_info['cuda_available'] or device_info['mps_available']):
+                # Use GPU memory manager to estimate optimal batch size
+                frame_size_mb = (self.video_info.width * self.video_info.height * 3) / (1024 * 1024)
+                batch_size = gpu_memory_manager.estimate_batch_size(frame_size_mb)
+                logger.info(f"Auto-adjusted batch size to {batch_size} based on GPU memory")
+            elif device_info['cuda_available']:
                 batch_size = 16  # Good default for most GPUs
             elif device_info['mps_available']:
                 batch_size = 8   # Apple Silicon - more conservative
             else:
                 batch_size = 1   # CPU - no benefit from batching
+
+        # Set GPU memory limit if configured
+        if settings.gpu_memory_limit_gb > 0:
+            gpu_memory_manager.set_memory_limit(settings.gpu_memory_limit_gb)
 
         logger.info(
             f"Starting {depth.value} analysis | "
@@ -421,6 +453,21 @@ class VideoProcessor:
         pipeline_config = AnalysisPipelineConfig.from_depth(pipeline_depth)
         self.analysis_pipeline = AnalysisPipeline(pipeline_config)
         self.frame_analysis_results.clear()
+
+        # Initialize advanced analytics modules based on depth
+        if depth in (AnalysisDepth.STANDARD, AnalysisDepth.DEEP):
+            self.heatmap_generator = HeatmapGenerator(
+                pitch_width=105, pitch_height=68
+            )
+            self.speed_tracker = SpeedDistanceTracker(fps=self.video_info.fps)
+            self.possession_sequence_tracker = PossessionSequenceTracker()
+            self.id_stabilizer = IDStabilizer()
+
+        if depth == AnalysisDepth.DEEP:
+            self.pass_network_analyzer = PassNetworkAnalyzer()
+            self.shot_detector = ShotDetector()
+            self.game_period_detector = GamePeriodDetector(fps=self.video_info.fps)
+            self.detected_periods = []
 
         start_time = datetime.now()
         processed_frames = 0
@@ -564,6 +611,9 @@ class VideoProcessor:
                 processed_frames, total_frames_to_process, start_time
             )
 
+            # Periodic GPU cache clearing
+            gpu_memory_manager.maybe_clear_cache(frame_num)
+
         return processed_frames
 
     def _process_video_batched(
@@ -628,8 +678,12 @@ class VideoProcessor:
                 self.team_classifier.classify_players(detections.players)
                 self.team_classifier.classify_players(detections.goalkeepers)
 
-                # Calculate possession
-                self.possession_calculator.calculate_possession(detections)
+                # Calculate possession and store it on detections
+                detections.possession_team = self.possession_calculator.calculate_possession(detections)
+
+                # Stabilize tracker IDs
+                if self.id_stabilizer:
+                    self.id_stabilizer.stabilize(detections, frame_num)
 
                 # Update detection statistics
                 self._update_detection_stats(detections)
@@ -643,6 +697,9 @@ class VideoProcessor:
                         self.frame_analysis_results[frame_num] = analysis_result
                     except Exception as analysis_error:
                         logger.debug(f"Analysis pipeline error on frame {frame_num}: {analysis_error}")
+
+                # Update advanced analytics
+                self._update_advanced_analytics(detections)
 
                 # Store detections
                 self.frame_detections[frame_num] = detections
@@ -665,6 +722,9 @@ class VideoProcessor:
                     frame_numbers[-1], start_frame, end_frame,
                     processed_frames, total_frames_to_process, start_time
                 )
+
+                # Periodic GPU cache clearing
+                gpu_memory_manager.maybe_clear_cache(frame_numbers[-1])
 
         return processed_frames
 
@@ -693,11 +753,15 @@ class VideoProcessor:
             self.team_classifier.classify_players(detections.players)
             self.team_classifier.classify_players(detections.goalkeepers)
 
-            # Calculate possession
-            self.possession_calculator.calculate_possession(detections)
+            # Calculate possession and store it on detections
+            detections.possession_team = self.possession_calculator.calculate_possession(detections)
 
             # Update detection statistics
             self._update_detection_stats(detections)
+
+            # Stabilize tracker IDs
+            if self.id_stabilizer:
+                self.id_stabilizer.stabilize(detections, frame_num)
 
             # Run tactical analysis pipeline
             if self.analysis_pipeline:
@@ -708,6 +772,9 @@ class VideoProcessor:
                     self.frame_analysis_results[frame_num] = analysis_result
                 except Exception as analysis_error:
                     logger.debug(f"Analysis pipeline error on frame {frame_num}: {analysis_error}")
+
+            # Update advanced analytics
+            self._update_advanced_analytics(detections)
 
             # Store detections
             self.frame_detections[frame_num] = detections
@@ -722,6 +789,35 @@ class VideoProcessor:
             )
             self.frame_detections[frame_num] = detections
             return detections
+
+    def _update_advanced_analytics(self, detections: FrameDetections):
+        """Update all advanced analytics modules with detection data."""
+        try:
+            # Get video dimensions for coordinate conversion
+            frame_width = self.video_info.width if self.video_info else 1920
+            frame_height = self.video_info.height if self.video_info else 1080
+
+            # Update heatmaps - use add_frame_detections for proper conversion
+            if self.heatmap_generator:
+                self.heatmap_generator.add_frame_detections(detections, frame_width, frame_height)
+
+            # Update speed/distance tracking
+            if self.speed_tracker:
+                self.speed_tracker.add_positions(detections, detections.frame_number)
+
+            # Update possession sequences
+            if self.possession_sequence_tracker:
+                self.possession_sequence_tracker.update(detections, detections.possession_team)
+
+            # Detect shots
+            if self.shot_detector and detections.ball:
+                self.shot_detector.detect_shot(detections, frame_width, frame_height)
+
+            # Add frame data for game period detection (detected at end of processing)
+            if self.game_period_detector:
+                self.game_period_detector.add_frame(detections)
+        except Exception as e:
+            logger.debug(f"Advanced analytics update error: {e}")
 
     def _report_progress(
         self,
@@ -891,6 +987,77 @@ class VideoProcessor:
     def get_frame_analysis(self, frame_number: int) -> Optional[FrameAnalysisResult]:
         """Get tactical analysis for a specific frame"""
         return self.frame_analysis_results.get(frame_number)
+
+    def get_heatmap(self, team_id: Optional[int] = None, player_id: Optional[int] = None) -> Optional[np.ndarray]:
+        """
+        Get heatmap for a team or player.
+
+        Args:
+            team_id: Team to get heatmap for (0=home, 1=away)
+            player_id: Specific player tracker ID
+
+        Returns:
+            Heatmap as numpy array or None if not available
+        """
+        if self.heatmap_generator is None:
+            return None
+
+        if player_id is not None:
+            return self.heatmap_generator.get_player_heatmap(player_id)
+        elif team_id is not None:
+            return self.heatmap_generator.get_team_heatmap(team_id)
+        else:
+            return self.heatmap_generator.get_combined_heatmap()
+
+    def get_player_stats(self, player_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get speed/distance stats for a player.
+
+        Args:
+            player_id: Player tracker ID
+
+        Returns:
+            Dict with distance_km, avg_speed_kmh, max_speed_kmh, sprints
+        """
+        if self.speed_tracker is None:
+            return None
+        return self.speed_tracker.get_player_stats(player_id)
+
+    def get_all_player_stats(self) -> Dict[int, Dict[str, Any]]:
+        """Get speed/distance stats for all tracked players"""
+        if self.speed_tracker is None:
+            return {}
+        return self.speed_tracker.get_all_player_stats()
+
+    def get_pass_network(self, team_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get pass network data for a team.
+
+        Args:
+            team_id: Team (0=home, 1=away)
+
+        Returns:
+            Dict with nodes (players) and edges (passes)
+        """
+        if self.pass_network_analyzer is None:
+            return None
+        return self.pass_network_analyzer.get_network_data(team_id)
+
+    def get_possession_sequences(self) -> List[Dict[str, Any]]:
+        """Get all possession sequences detected"""
+        if self.possession_sequence_tracker is None:
+            return []
+        return self.possession_sequence_tracker.get_sequences()
+
+    def get_detected_shots(self) -> List[Dict[str, Any]]:
+        """Get all detected shots"""
+        if self.shot_detector is None:
+            return []
+        return self.shot_detector.get_shots()
+
+    def get_game_periods(self) -> List[GamePeriod]:
+        """Get detected game periods (halves, extra time)"""
+        return self.detected_periods
 
     def iterate_frames(
         self,

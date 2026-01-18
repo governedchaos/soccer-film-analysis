@@ -21,9 +21,9 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QPalette, QColor
 from loguru import logger
 
-from config import settings, AnalysisDepth
+from config import settings, AnalysisDepth, config_persistence
 from src.core.video_processor import ThreadedVideoProcessor, VideoInfo, AnalysisProgress
-from src.detection.detector import FrameDetections
+from src.detection.detector import FrameDetections, draw_detections
 
 # Import widgets from the widgets module
 from src.gui.widgets import (
@@ -33,6 +33,15 @@ from src.gui.widgets import (
 
 # Import controllers
 from src.gui.controllers import VideoController, AnalysisController
+
+# Import keyboard shortcuts
+from src.gui.keyboard_shortcuts import (
+    KeyboardShortcutManager,
+    ShortcutEditorDialog
+)
+
+# Import auto-save
+from src.analysis.auto_save import AutoSaveManager, AnalysisStateManager
 
 
 class GameConfigDialog(QDialog):
@@ -171,14 +180,45 @@ class GameConfigDialog(QDialog):
 
     def set_config(self, config: dict):
         """Load configuration from dictionary"""
+        # Home team settings
         if "home_team" in config:
-            self.home_team_name.setText(config["home_team"].get("name", ""))
-            if "primary_color" in config["home_team"]:
-                self.home_primary_color.set_color(config["home_team"]["primary_color"])
+            home = config["home_team"]
+            self.home_team_name.setText(home.get("name", ""))
+            if "primary_color" in home:
+                self.home_primary_color.set_color(home["primary_color"])
+            if "secondary_color" in home:
+                self.home_secondary_color.set_color(home["secondary_color"])
+            if "goalkeeper_color" in home:
+                self.home_gk_color.set_color(home["goalkeeper_color"])
+
+        # Away team settings
         if "away_team" in config:
-            self.away_team_name.setText(config["away_team"].get("name", ""))
-            if "primary_color" in config["away_team"]:
-                self.away_primary_color.set_color(config["away_team"]["primary_color"])
+            away = config["away_team"]
+            self.away_team_name.setText(away.get("name", ""))
+            if "primary_color" in away:
+                self.away_primary_color.set_color(away["primary_color"])
+            if "secondary_color" in away:
+                self.away_secondary_color.set_color(away["secondary_color"])
+            if "goalkeeper_color" in away:
+                self.away_gk_color.set_color(away["goalkeeper_color"])
+
+        # Referee color
+        if "referee_color" in config:
+            self.referee_color.set_color(config["referee_color"])
+
+        # Game info
+        if "competition" in config:
+            self.competition.setText(config["competition"])
+        if "venue" in config:
+            self.venue.setText(config["venue"])
+
+        # Detection settings
+        if "detection" in config:
+            detection = config["detection"]
+            if "player_confidence" in detection:
+                self.player_confidence.setValue(detection["player_confidence"])
+            if "ball_confidence" in detection:
+                self.ball_confidence.setValue(detection["ball_confidence"])
 
 
 class MainWindow(QMainWindow):
@@ -205,6 +245,18 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         self.setup_menu()
         self.connect_signals()
+
+        # Initialize keyboard shortcut manager
+        self.shortcut_manager = KeyboardShortcutManager(self)
+        self._setup_shortcuts()
+
+        # Initialize auto-save manager
+        self.auto_save_manager = AutoSaveManager(interval_seconds=300)  # 5 minutes
+        self.state_manager = AnalysisStateManager()
+        self._setup_auto_save()
+
+        # Load saved user configuration
+        self._load_user_config()
 
         logger.info("MainWindow initialized")
 
@@ -347,6 +399,10 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self.load_video)
         file_menu.addAction(open_action)
 
+        # Recent Files submenu
+        self.recent_files_menu = file_menu.addMenu("Recent &Files")
+        self._update_recent_files_menu()
+
         file_menu.addSeparator()
 
         exit_action = QAction("E&xit", self)
@@ -376,6 +432,24 @@ class MainWindow(QMainWindow):
         game_config_action.setShortcut("Ctrl+G")
         game_config_action.triggered.connect(self.open_game_config)
         settings_menu.addAction(game_config_action)
+
+        shortcuts_action = QAction("&Keyboard Shortcuts...", self)
+        shortcuts_action.setShortcut("Ctrl+K")
+        shortcuts_action.triggered.connect(self.open_shortcut_editor)
+        settings_menu.addAction(shortcuts_action)
+
+        settings_menu.addSeparator()
+
+        # State management
+        save_state_action = QAction("&Save Analysis State", self)
+        save_state_action.setShortcut("Ctrl+S")
+        save_state_action.triggered.connect(self._save_analysis_state)
+        settings_menu.addAction(save_state_action)
+
+        load_state_action = QAction("&Load Analysis State...", self)
+        load_state_action.setShortcut("Ctrl+L")
+        load_state_action.triggered.connect(self._load_analysis_state)
+        settings_menu.addAction(load_state_action)
 
         # Help menu
         help_menu = menubar.addMenu("&Help")
@@ -426,6 +500,9 @@ class MainWindow(QMainWindow):
         self.log_message(f"Loading video: {file_path}", "INFO")
 
         if self.video_controller.load_video(file_path):
+            # Add to recent files
+            config_persistence.add_recent_file(file_path)
+            self._update_recent_files_menu()
             # Auto-calibrate team colors
             self.status_bar.showMessage("Calibrating team colors...")
             self.log_message("Calibrating team colors from sample frames...", "INFO")
@@ -491,29 +568,69 @@ class MainWindow(QMainWindow):
 
     def _on_analysis_progress(self, progress: AnalysisProgress):
         """Handle analysis progress update"""
-        self.control_panel.update_progress(progress)
-        if progress.current_frame % 100 == 0:
-            self.log_message(
-                f"Frame {progress.current_frame}/{progress.total_frames} "
-                f"({progress.percentage:.1f}%) - {progress.frames_per_second:.1f} FPS",
-                "DEBUG"
-            )
+        try:
+            logger.debug(f"[SLOT] _on_analysis_progress called: frame {progress.current_frame}")
+            self.control_panel.update_progress(progress)
+            if progress.current_frame % 100 == 0:
+                self.log_message(
+                    f"Frame {progress.current_frame}/{progress.total_frames} "
+                    f"({progress.percentage:.1f}%) - {progress.frames_per_second:.1f} FPS",
+                    "DEBUG"
+                )
+            logger.debug(f"[SLOT] _on_analysis_progress completed successfully")
+        except Exception as e:
+            logger.error(f"[SLOT] _on_analysis_progress CRASHED: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def _on_frame_analyzed(self, frame: np.ndarray, detections: FrameDetections):
         """Handle analyzed frame"""
-        self.video_widget.display_frame(frame)
-        possession = self.analysis_controller.get_possession()
-        self.stats_panel.update_stats(
-            detections.frame_number, self.video_controller.fps, detections, possession
-        )
+        try:
+            logger.debug(f"[SLOT] _on_frame_analyzed called: frame {detections.frame_number}")
+            logger.debug(f"[SLOT] Frame shape: {frame.shape if frame is not None else 'None'}")
 
-        if detections.frame_number % 50 == 0:
-            player_count = len(detections.players)
-            ball_detected = "Yes" if detections.ball else "No"
-            self.log_message(
-                f"Frame {detections.frame_number}: {player_count} players, ball: {ball_detected}",
-                "DEBUG"
+            # Draw detections on frame before displaying
+            # Use team colors from game config if available
+            team_colors = None
+            if hasattr(self, '_game_config') and self._game_config:
+                home_color = self._game_config.get("home_team", {}).get("primary_color")
+                away_color = self._game_config.get("away_team", {}).get("primary_color")
+                if home_color and away_color:
+                    # Convert RGB to BGR for OpenCV
+                    team_colors = {
+                        0: (home_color[2], home_color[1], home_color[0]),  # RGB -> BGR
+                        1: (away_color[2], away_color[1], away_color[0]),  # RGB -> BGR
+                        -1: (128, 128, 128)  # Unknown - Gray
+                    }
+
+            annotated_frame = draw_detections(frame, detections, team_colors=team_colors)
+
+            logger.debug(f"[SLOT] Calling video_widget.display_frame...")
+            self.video_widget.display_frame(annotated_frame)
+            logger.debug(f"[SLOT] display_frame completed")
+
+            logger.debug(f"[SLOT] Getting possession...")
+            possession = self.analysis_controller.get_possession()
+            logger.debug(f"[SLOT] Possession: {possession}")
+
+            logger.debug(f"[SLOT] Updating stats...")
+            self.stats_panel.update_stats(
+                detections.frame_number, self.video_controller.fps, detections, possession
             )
+            logger.debug(f"[SLOT] Stats updated")
+
+            if detections.frame_number % 50 == 0:
+                player_count = len(detections.players)
+                ball_detected = "Yes" if detections.ball else "No"
+                self.log_message(
+                    f"Frame {detections.frame_number}: {player_count} players, ball: {ball_detected}",
+                    "DEBUG"
+                )
+            logger.debug(f"[SLOT] _on_frame_analyzed completed successfully")
+        except Exception as e:
+            logger.error(f"[SLOT] _on_frame_analyzed CRASHED: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def _on_analysis_completed(self, result: dict):
         """Handle analysis completion"""
@@ -680,8 +797,213 @@ class MainWindow(QMainWindow):
             "<p>2026</p>"
         )
 
+    def _setup_shortcuts(self):
+        """Setup keyboard shortcuts"""
+        # Register callbacks for predefined actions
+        # Video Playback
+        self.shortcut_manager.register_action("play_pause", self._toggle_playback)
+        self.shortcut_manager.register_action("step_forward", lambda: self.video_controller.seek_relative(1))
+        self.shortcut_manager.register_action("step_backward", lambda: self.video_controller.seek_relative(-1))
+        self.shortcut_manager.register_action("skip_forward", lambda: self.video_controller.seek_relative(150))  # 5 sec at 30fps
+        self.shortcut_manager.register_action("skip_backward", lambda: self.video_controller.seek_relative(-150))
+        self.shortcut_manager.register_action("goto_start", lambda: self.video_controller.seek(0))
+        self.shortcut_manager.register_action("goto_end", lambda: self.video_controller.seek(self.video_controller.total_frames - 1) if self.video_controller.total_frames else None)
+
+        # Analysis
+        self.shortcut_manager.register_action("start_analysis", lambda: self.start_analysis("standard"))
+        self.shortcut_manager.register_action("stop_analysis", self.analysis_controller.stop_analysis)
+        self.shortcut_manager.register_action("export_results", self.export_results)
+
+        # File
+        self.shortcut_manager.register_action("open_video", self.load_video)
+        self.shortcut_manager.register_action("save_project", self._save_analysis_state)
+        self.shortcut_manager.register_action("load_project", self._load_analysis_state)
+        self.shortcut_manager.register_action("game_settings", self.open_game_config)
+
+        # View
+        self.shortcut_manager.register_action("toggle_log", lambda: self.log_toggle_btn.click())
+
+        self.log_message("Keyboard shortcuts initialized", "DEBUG")
+
+    def _toggle_playback(self):
+        """Toggle play/pause"""
+        if self.video_controller.is_playing:
+            self.video_controller.pause()
+        else:
+            self.video_controller.play()
+
+    def _setup_auto_save(self):
+        """Setup auto-save functionality"""
+        # Connect auto-save to analysis progress
+        self.analysis_controller.analysis_progress.connect(self._on_progress_autosave)
+        self.analysis_controller.analysis_completed.connect(self._on_analysis_autosave)
+
+    def _on_progress_autosave(self, progress: AnalysisProgress):
+        """Auto-save on progress milestones"""
+        # Auto-save every 10% progress
+        if int(progress.percentage) % 10 == 0 and progress.percentage > 0:
+            if self.auto_save_manager.should_auto_save():
+                self._save_analysis_state()
+
+    def _on_analysis_autosave(self, result: dict):
+        """Auto-save when analysis completes"""
+        self._save_analysis_state()
+        self.log_message("Analysis state auto-saved", "INFO")
+
+    def _save_analysis_state(self):
+        """Save current analysis state"""
+        try:
+            state = self.state_manager.capture_state()
+            if state:
+                video_path = str(self.video_controller.video_info.path) if self.video_controller.video_info else None
+                filepath = self.auto_save_manager.save_state(state, video_path)
+                if filepath:
+                    self.log_message(f"State saved: {filepath}", "INFO")
+        except Exception as e:
+            self.log_message(f"Failed to save state: {e}", "ERROR")
+
+    def _load_analysis_state(self):
+        """Load a previously saved analysis state"""
+        try:
+            states = self.auto_save_manager.list_saved_states()
+            if not states:
+                QMessageBox.information(self, "No Saved States", "No saved analysis states found.")
+                return
+
+            # Show dialog to select state
+            from PyQt6.QtWidgets import QInputDialog
+            items = [f"{s['video_name']} - {s['saved_at']}" for s in states]
+            item, ok = QInputDialog.getItem(
+                self, "Load State", "Select state to load:", items, 0, False
+            )
+
+            if ok and item:
+                idx = items.index(item)
+                state = self.auto_save_manager.load_state(states[idx]['filepath'])
+                if state:
+                    self.state_manager.restore_state(state)
+                    self.log_message(f"State loaded from {states[idx]['filepath']}", "INFO")
+        except Exception as e:
+            self.log_message(f"Failed to load state: {e}", "ERROR")
+            QMessageBox.critical(self, "Load Failed", f"Failed to load state: {e}")
+
+    def open_shortcut_editor(self):
+        """Open the keyboard shortcut editor dialog"""
+        dialog = ShortcutEditorDialog(self.shortcut_manager, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.log_message("Keyboard shortcuts updated", "INFO")
+
+    def _load_user_config(self):
+        """Load saved user configuration at startup"""
+        try:
+            config = config_persistence.load_user_config()
+            if config:
+                # Restore game configuration
+                if "game_config" in config:
+                    self._game_config = config["game_config"]
+                    self._apply_game_config()
+                    self.log_message("Restored game configuration from previous session", "INFO")
+
+                # Restore window geometry
+                if "window" in config:
+                    window_config = config["window"]
+                    if "width" in window_config and "height" in window_config:
+                        self.resize(window_config["width"], window_config["height"])
+                    if "x" in window_config and "y" in window_config:
+                        self.move(window_config["x"], window_config["y"])
+
+                self.log_message("User configuration loaded", "DEBUG")
+        except Exception as e:
+            self.log_message(f"Failed to load user config: {e}", "WARNING")
+
+    def _save_user_config(self):
+        """Save user configuration for next session"""
+        try:
+            config = {
+                "game_config": self._game_config,
+                "window": {
+                    "width": self.width(),
+                    "height": self.height(),
+                    "x": self.x(),
+                    "y": self.y()
+                }
+            }
+            config_persistence.save_user_config(config)
+            self.log_message("User configuration saved", "DEBUG")
+        except Exception as e:
+            self.log_message(f"Failed to save user config: {e}", "WARNING")
+
+    def _update_recent_files_menu(self):
+        """Update the Recent Files menu with saved recent files"""
+        if not hasattr(self, 'recent_files_menu'):
+            return
+
+        self.recent_files_menu.clear()
+
+        recent_files = config_persistence.load_recent_files()
+        if not recent_files:
+            no_recent = QAction("(No recent files)", self)
+            no_recent.setEnabled(False)
+            self.recent_files_menu.addAction(no_recent)
+            return
+
+        for file_path in recent_files:
+            action = QAction(Path(file_path).name, self)
+            action.setToolTip(file_path)
+            action.triggered.connect(lambda checked, path=file_path: self._open_recent_file(path))
+            self.recent_files_menu.addAction(action)
+
+        self.recent_files_menu.addSeparator()
+        clear_action = QAction("Clear Recent Files", self)
+        clear_action.triggered.connect(self._clear_recent_files)
+        self.recent_files_menu.addAction(clear_action)
+
+    def _open_recent_file(self, file_path: str):
+        """Open a file from the recent files list"""
+        if Path(file_path).exists():
+            self.log_message(f"Loading video: {file_path}", "INFO")
+            if self.video_controller.load_video(file_path):
+                config_persistence.add_recent_file(file_path)
+                self._update_recent_files_menu()
+                self.status_bar.showMessage("Calibrating team colors...")
+                self.video_controller.calibrate_teams()
+                self.status_bar.showMessage(f"Loaded: {Path(file_path).name} (ready)")
+        else:
+            QMessageBox.warning(self, "File Not Found", f"File no longer exists:\n{file_path}")
+            # Remove from recent files
+            recent = config_persistence.load_recent_files()
+            if file_path in recent:
+                recent.remove(file_path)
+                config_persistence.save_recent_files(recent)
+                self._update_recent_files_menu()
+
+    def _clear_recent_files(self):
+        """Clear the recent files list"""
+        config_persistence.save_recent_files([])
+        self._update_recent_files_menu()
+        self.log_message("Recent files cleared", "INFO")
+
     def closeEvent(self, event):
         """Handle window close"""
+        # Save state before closing if analysis was done
+        if self.analysis_controller.has_results:
+            reply = QMessageBox.question(
+                self, "Save Analysis?",
+                "Do you want to save the current analysis state before closing?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._save_analysis_state()
+            elif reply == QMessageBox.StandardButton.Cancel:
+                event.ignore()
+                return
+
+        # Save user configuration
+        self._save_user_config()
+
+        # Stop auto-save
+        self.auto_save_manager.stop()
+
         self.video_controller.release()
         event.accept()
 

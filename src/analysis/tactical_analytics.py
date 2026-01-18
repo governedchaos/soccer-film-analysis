@@ -384,6 +384,20 @@ class PressingAnalyzer:
 
         return data['passes_allowed'] / data['defensive_actions']
 
+    def get_match_ppda(self) -> Dict[str, float]:
+        """
+        Get PPDA (Passes Per Defensive Action) for both teams for the match.
+
+        Lower PPDA = more intense pressing (fewer passes allowed per action)
+
+        Returns:
+            Dict with 'home' and 'away' PPDA values
+        """
+        return {
+            'home': self.calculate_ppda(0),
+            'away': self.calculate_ppda(1)
+        }
+
     def get_metrics(self, team_id: int) -> PressingMetrics:
         """Get all pressing metrics for a team"""
         data = self.home_data if team_id == 0 else self.away_data

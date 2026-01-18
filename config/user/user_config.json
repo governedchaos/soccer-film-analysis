@@ -1,0 +1,59 @@
+{
+  "_saved_at": "2026-01-18T11:49:05.439378",
+  "_version": "1.0",
+  "game_config": {
+    "home_team": {
+      "name": "Madison La Follette",
+      "primary_color": [
+        85,
+        0,
+        0
+      ],
+      "secondary_color": [
+        0,
+        0,
+        0
+      ],
+      "goalkeeper_color": [
+        255,
+        0,
+        255
+      ]
+    },
+    "away_team": {
+      "name": "Madison East",
+      "primary_color": [
+        255,
+        255,
+        255
+      ],
+      "secondary_color": [
+        0,
+        0,
+        0
+      ],
+      "goalkeeper_color": [
+        0,
+        0,
+        127
+      ]
+    },
+    "referee_color": [
+      255,
+      255,
+      0
+    ],
+    "competition": "",
+    "venue": "",
+    "detection": {
+      "player_confidence": 0.3,
+      "ball_confidence": 0.25
+    }
+  },
+  "window": {
+    "width": 2560,
+    "height": 1369,
+    "x": 0,
+    "y": -8
+  }
+}

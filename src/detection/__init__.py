@@ -26,6 +26,21 @@ from .enhanced_detector import (
     TrackedPerson
 )
 
+# Jersey number OCR
+from .jersey_ocr import (
+    JerseyNumberReader,
+    JerseyNumberResult,
+    BatchJerseyReader,
+    PlayerRoster
+)
+
+# Tracking persistence
+from .tracking_persistence import (
+    PlayerTrackHistory,
+    TrackingPersistenceManager,
+    IDStabilizer
+)
+
 __all__ = [
     # Base detector
     'SoccerDetector',
@@ -44,4 +59,13 @@ __all__ = [
     # Enhanced detector
     'EnhancedDetector',
     'TrackedPerson',
+    # Jersey OCR
+    'JerseyNumberReader',
+    'JerseyNumberResult',
+    'BatchJerseyReader',
+    'PlayerRoster',
+    # Tracking persistence
+    'PlayerTrackHistory',
+    'TrackingPersistenceManager',
+    'IDStabilizer',
 ]

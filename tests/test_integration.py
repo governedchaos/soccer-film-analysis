@@ -180,7 +180,6 @@ class TestAnalysisPipeline:
         assert isinstance(result, FrameAnalysisResult)
         assert result.frame_number == 0
 
-    @pytest.mark.skip(reason="PressingAnalyzer.get_match_ppda not implemented")
     def test_pipeline_tracks_possession(self):
         """Test that pipeline tracks possession changes"""
         generator = SyntheticFrameGenerator()
@@ -193,9 +192,8 @@ class TestAnalysisPipeline:
 
         summary = pipeline.get_summary()
         # Should have tracked some possession
-        assert summary.total_frames_analyzed == 50
+        assert summary.frames_analyzed == 50
 
-    @pytest.mark.skip(reason="PressingAnalyzer.get_match_ppda not implemented")
     def test_pipeline_get_summary(self):
         """Test getting analysis summary"""
         generator = SyntheticFrameGenerator()
@@ -206,7 +204,7 @@ class TestAnalysisPipeline:
             pipeline.process_frame(detections, fps=30.0)
 
         summary = pipeline.get_summary()
-        assert summary.total_frames_analyzed == 20
+        assert summary.frames_analyzed == 20
         assert hasattr(summary, 'possession_home')
         assert hasattr(summary, 'possession_away')
 
@@ -339,7 +337,6 @@ class TestPossessionCalculator:
 class TestFullPipelineIntegration:
     """Full end-to-end integration tests"""
 
-    @pytest.mark.skip(reason="sklearn KMeans version compatibility issue")
     def test_detection_to_analysis_flow(self):
         """Test complete flow from detection to analysis"""
         # Create components
@@ -367,13 +364,12 @@ class TestFullPipelineIntegration:
 
         # Verify summary
         summary = pipeline.get_summary()
-        assert summary.total_frames_analyzed == 30
+        assert summary.frames_analyzed == 30
 
         home_poss, away_poss = possession_calc.get_possession_percentage()
         assert 0 <= home_poss <= 100
         assert 0 <= away_poss <= 100
 
-    @pytest.mark.skip(reason="sklearn KMeans version compatibility issue")
     def test_cache_improves_with_tracking(self):
         """Test that caching provides benefit with tracked players"""
         classifier = TeamClassifier()
