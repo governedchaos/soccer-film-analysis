@@ -183,6 +183,12 @@ class SoccerDetector:
         # Field boundary for position-based classification
         self.field_bounds: Optional[Tuple[int, int, int, int]] = None  # x1, y1, x2, y2
 
+        # Color cache for tracked players (tracker_id -> dominant_color)
+        # Avoids expensive color extraction for players we've already classified
+        self._color_cache: Dict[int, Tuple[int, int, int]] = {}
+        self._color_cache_hits = 0
+        self._color_cache_misses = 0
+
         # Pitch configuration
         self.pitch_config = None
         if SPORTS_AVAILABLE:
@@ -319,9 +325,19 @@ class SoccerDetector:
             tracker_id = int(detections.tracker_id[i]) if detections.tracker_id is not None else None
 
             # Extract dominant color from detection region (for persons)
+            # Use cache if we've already extracted color for this tracked player
             dominant_color = None
             if class_id == self.COCO_PERSON:
-                dominant_color = self._extract_dominant_color(frame, bbox)
+                if tracker_id is not None and tracker_id in self._color_cache:
+                    # Cache hit - reuse previously extracted color
+                    dominant_color = self._color_cache[tracker_id]
+                    self._color_cache_hits += 1
+                else:
+                    # Cache miss - extract color and cache it
+                    dominant_color = self._extract_dominant_color(frame, bbox)
+                    self._color_cache_misses += 1
+                    if tracker_id is not None and dominant_color is not None:
+                        self._color_cache[tracker_id] = dominant_color
 
             # Handle ball detection
             if class_id == self.COCO_SPORTS_BALL:
@@ -675,9 +691,23 @@ class SoccerDetector:
         return results_list
 
     def reset_tracker(self):
-        """Reset the object tracker (call between videos)"""
+        """Reset the object tracker and color cache (call between videos)"""
         self._tracker = None
-        logger.debug("Tracker reset")
+        self._color_cache.clear()
+        self._color_cache_hits = 0
+        self._color_cache_misses = 0
+        logger.debug("Tracker and color cache reset")
+
+    def get_color_cache_stats(self) -> Dict[str, Any]:
+        """Get color cache statistics for performance monitoring"""
+        total = self._color_cache_hits + self._color_cache_misses
+        hit_rate = (self._color_cache_hits / total * 100) if total > 0 else 0.0
+        return {
+            "cache_size": len(self._color_cache),
+            "cache_hits": self._color_cache_hits,
+            "cache_misses": self._color_cache_misses,
+            "hit_rate_percent": hit_rate
+        }
 
 
 # ============================================
@@ -687,22 +717,28 @@ class SoccerDetector:
 class TeamClassifier:
     """
     Classifies players into teams based on jersey color.
-    Uses K-means clustering on player colors.
+    Uses K-means clustering on player colors with caching for tracked players.
     """
-    
+
     def __init__(self, n_teams: int = 2):
         """
         Initialize team classifier.
-        
+
         Args:
             n_teams: Number of teams (default 2)
         """
         from sklearn.cluster import KMeans
-        
+
         self.n_teams = n_teams
         self.kmeans = KMeans(n_clusters=n_teams, n_init=10, random_state=42)
         self._is_fitted = False
         self._team_colors = None
+
+        # Team classification cache (tracker_id -> team_id)
+        # Avoids repeated KMeans predictions for tracked players
+        self._team_cache: Dict[int, int] = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
     
     def fit(self, colors: List[Tuple[int, int, int]]):
         """
@@ -741,18 +777,26 @@ class TeamClassifier:
     
     def classify_players(self, players: List[PlayerDetection]) -> List[PlayerDetection]:
         """
-        Classify all players in a list.
-        
+        Classify all players in a list, using cache for tracked players.
+
         Args:
             players: List of PlayerDetection objects with dominant_color set
-            
+
         Returns:
             Same list with team_id assigned
         """
         for player in players:
-            if player.dominant_color is not None:
+            # Check cache first for tracked players
+            if player.tracker_id is not None and player.tracker_id in self._team_cache:
+                player.team_id = self._team_cache[player.tracker_id]
+                self._cache_hits += 1
+            elif player.dominant_color is not None:
+                # Cache miss - classify and cache the result
                 player.team_id = self.classify(player.dominant_color)
-        
+                self._cache_misses += 1
+                if player.tracker_id is not None and player.team_id >= 0:
+                    self._team_cache[player.tracker_id] = player.team_id
+
         return players
     
     @property
@@ -767,7 +811,7 @@ class TeamClassifier:
     ):
         """
         Manually set team colors instead of learning them.
-        
+
         Args:
             home_color: RGB tuple for home team
             away_color: RGB tuple for away team
@@ -775,8 +819,28 @@ class TeamClassifier:
         self._team_colors = np.array([home_color, away_color])
         self.kmeans.cluster_centers_ = self._team_colors.astype(np.float64)
         self._is_fitted = True
-        
+        # Clear cache when team colors change
+        self._team_cache.clear()
+
         logger.info(f"Team colors manually set: Home={home_color}, Away={away_color}")
+
+    def reset_cache(self):
+        """Reset the team classification cache (call between videos)"""
+        self._team_cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        logger.debug("Team classification cache reset")
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics for performance monitoring"""
+        total = self._cache_hits + self._cache_misses
+        hit_rate = (self._cache_hits / total * 100) if total > 0 else 0.0
+        return {
+            "cache_size": len(self._team_cache),
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "hit_rate_percent": hit_rate
+        }
 
 
 # ============================================

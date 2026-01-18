@@ -279,9 +279,10 @@ class VideoProcessor:
         
         # Reset state
         self.detector.reset_tracker()
+        self.team_classifier.reset_cache()
         self.frame_detections.clear()
         self._current_frame = 0
-        
+
         return self.video_info
     
     def calibrate_teams(
@@ -808,11 +809,15 @@ class VideoProcessor:
             )
 
     def get_detection_stats(self) -> Dict[str, Any]:
-        """Get current detection statistics"""
-        return self._detection_stats.copy()
+        """Get current detection statistics including cache performance"""
+        stats = self._detection_stats.copy()
+        # Add cache stats
+        stats["color_cache"] = self.detector.get_color_cache_stats()
+        stats["team_cache"] = self.team_classifier.get_cache_stats()
+        return stats
 
     def log_detection_stats(self):
-        """Log detection statistics summary"""
+        """Log detection statistics summary including cache performance"""
         stats = self._detection_stats
         logger.info("=" * 50)
         logger.info("DETECTION STATISTICS SUMMARY")
@@ -824,6 +829,17 @@ class VideoProcessor:
         logger.info(f"  - Home team: {stats['home_team_detections']}")
         logger.info(f"  - Away team: {stats['away_team_detections']}")
         logger.info(f"Referee detections: {stats['total_referee_detections']}")
+
+        # Log cache performance stats
+        logger.info("-" * 50)
+        logger.info("CACHE PERFORMANCE")
+        color_stats = self.detector.get_color_cache_stats()
+        team_stats = self.team_classifier.get_cache_stats()
+        logger.info(f"Color cache: {color_stats['cache_hits']} hits, {color_stats['cache_misses']} misses "
+                   f"({color_stats['hit_rate_percent']:.1f}% hit rate)")
+        logger.info(f"Team cache:  {team_stats['cache_hits']} hits, {team_stats['cache_misses']} misses "
+                   f"({team_stats['hit_rate_percent']:.1f}% hit rate)")
+        logger.info(f"Unique players tracked: {color_stats['cache_size']}")
         logger.info("=" * 50)
 
     def reset_detection_stats(self):
