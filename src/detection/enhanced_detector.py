@@ -205,11 +205,16 @@ class EnhancedDetector(SoccerDetector):
 
         # Additional heuristic: filter based on frame position
         # Sideline people are typically at very top/bottom or far left/right edges
-        def is_likely_sideline(bbox, frame_height, frame_width):
+        def is_likely_sideline_or_bench(bbox, frame_height, frame_width):
             x1, y1, x2, y2 = bbox
             cx = (x1 + x2) / 2
             cy = (y1 + y2) / 2
             height = y2 - y1
+
+            # Check if in technical area (coaches box)
+            if boundary and boundary.is_in_technical_area(cx, y2):
+                logger.debug(f"Filtered technical area (coaches box): bbox={bbox}")
+                return True
 
             # People at the very top of frame are likely in stands/sideline
             if y1 < frame_height * 0.08:
@@ -226,6 +231,18 @@ class EnhancedDetector(SoccerDetector):
                 logger.debug(f"Filtered sideline (small edge): bbox={bbox}")
                 return True
 
+            # People just outside the pitch boundary in center region are likely bench/coaches
+            if boundary:
+                # Check if just outside pitch but not a goalkeeper area
+                if not boundary.contains_point(cx, cy, margin=0):
+                    # Outside the pitch
+                    if not boundary.is_in_goal_area(cx, cy):
+                        # Not in goal area - likely sideline personnel
+                        # Check if they're close to the sideline (within margin)
+                        if boundary.contains_point(cx, cy, margin=80):
+                            logger.debug(f"Filtered bench area: bbox={bbox}")
+                            return True
+
             return False
 
         # Get frame dimensions from boundary or use defaults
@@ -241,7 +258,7 @@ class EnhancedDetector(SoccerDetector):
         filtered_players = []
         for player in results.players:
             # First check sideline heuristics
-            if is_likely_sideline(player.bbox, frame_height, frame_width):
+            if is_likely_sideline_or_bench(player.bbox, frame_height, frame_width):
                 continue
             # Then check pitch boundary
             if boundary is None or boundary.contains_bbox(player.bbox):
@@ -254,7 +271,7 @@ class EnhancedDetector(SoccerDetector):
         # Filter goalkeepers (they should be on pitch too)
         filtered_gks = []
         for gk in results.goalkeepers:
-            if is_likely_sideline(gk.bbox, frame_height, frame_width):
+            if is_likely_sideline_or_bench(gk.bbox, frame_height, frame_width):
                 continue
             if boundary is None or boundary.contains_bbox(gk.bbox):
                 filtered_gks.append(gk)
@@ -264,7 +281,7 @@ class EnhancedDetector(SoccerDetector):
         # Referees can be on or slightly off pitch
         filtered_refs = []
         for ref in results.referees:
-            if is_likely_sideline(ref.bbox, frame_height, frame_width):
+            if is_likely_sideline_or_bench(ref.bbox, frame_height, frame_width):
                 continue
             if boundary is None:
                 filtered_refs.append(ref)

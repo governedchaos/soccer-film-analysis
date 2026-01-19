@@ -67,6 +67,53 @@ class PitchBoundary:
 
         return left_goal, right_goal
 
+    def get_technical_areas(self) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
+        """
+        Estimate technical areas (coaches boxes) on the sidelines.
+
+        Technical areas are on the touchline, roughly centered between penalty areas.
+        Based on FIFA regulations: extends 1m each side of bench, within 1m of touchline.
+
+        Returns: (top_technical_area, bottom_technical_area) as (x1, y1, x2, y2)
+        """
+        pitch_width = self.max_x - self.min_x
+        pitch_height = self.max_y - self.min_y
+
+        # Technical areas span roughly 20% of pitch width, centered
+        ta_width = int(pitch_width * 0.20)
+        center_x = (self.min_x + self.max_x) // 2
+
+        # Technical area extends outside the pitch boundary
+        ta_depth = 60  # pixels outside the pitch
+
+        # Top sideline technical area (above pitch)
+        top_ta = (
+            center_x - ta_width // 2,
+            self.min_y - ta_depth,
+            center_x + ta_width // 2,
+            self.min_y
+        )
+
+        # Bottom sideline technical area (below pitch)
+        bottom_ta = (
+            center_x - ta_width // 2,
+            self.max_y,
+            center_x + ta_width // 2,
+            self.max_y + ta_depth
+        )
+
+        return top_ta, bottom_ta
+
+    def is_in_technical_area(self, x: float, y: float) -> bool:
+        """Check if a point is in a technical area (coaches box)."""
+        top_ta, bottom_ta = self.get_technical_areas()
+
+        def in_box(point_x, point_y, box):
+            x1, y1, x2, y2 = box
+            return x1 <= point_x <= x2 and y1 <= point_y <= y2
+
+        return in_box(x, y, top_ta) or in_box(x, y, bottom_ta)
+
     def contains_bbox(self, bbox: Tuple[float, float, float, float], threshold: float = 0.5) -> bool:
         """
         Check if a bounding box is mostly within the pitch.
