@@ -40,6 +40,10 @@ from src.analysis.advanced_analytics import (
 )
 from src.analysis.game_periods import GamePeriodDetector, GamePeriod
 from src.detection.tracking_persistence import IDStabilizer
+from src.exceptions import (
+    VideoLoadError, VideoFrameError, VideoProcessingError,
+    DetectionError, CalibrationError
+)
 
 
 @dataclass
@@ -280,15 +284,15 @@ class VideoProcessor:
         """
         path = Path(video_path)
         if not path.exists():
-            raise FileNotFoundError(f"Video file not found: {path}")
-        
+            raise VideoLoadError(str(path), "File not found")
+
         # Release previous capture if any
         if self._cap is not None:
             self._cap.release()
-        
+
         self._cap = cv2.VideoCapture(str(path))
         if not self._cap.isOpened():
-            raise ValueError(f"Failed to open video: {path}")
+            raise VideoLoadError(str(path), "OpenCV failed to open video")
         
         self.video_info = VideoInfo.from_capture(path, self._cap)
         
@@ -328,8 +332,8 @@ class VideoProcessor:
             True if calibration successful
         """
         if self._cap is None:
-            raise RuntimeError("No video loaded. Call load_video() first.")
-        
+            raise CalibrationError("No video loaded. Call load_video() first.")
+
         # Manual color override
         if home_color and away_color:
             self.team_classifier.set_team_colors(home_color, away_color)
@@ -544,7 +548,9 @@ class VideoProcessor:
         
         finally:
             self._is_processing = False
-    
+            # Flush any remaining tracking data
+            self._flush_tracking_batch()
+
     def stop_processing(self):
         """Stop the current analysis"""
         self._should_stop = True
@@ -1107,6 +1113,9 @@ class VideoProcessor:
                 session.flush()
                 game_id = game.id
             
+            # Store game_id for tracking data persistence
+            self._current_game_id = game_id
+
             # Create analysis session
             analysis = AnalysisSession(
                 game_id=game_id,
@@ -1119,14 +1128,93 @@ class VideoProcessor:
             )
             session.add(analysis)
             session.flush()
-            
+
             return analysis.id
     
     def _save_frame_data(self, session_id: int, detections: FrameDetections):
         """Save frame detection data to database (batched for performance)"""
-        # Implementation would batch writes for better performance
-        # Simplified here for clarity
-        pass
+        # Skip if no game_id (database not initialized)
+        if not hasattr(self, '_current_game_id') or self._current_game_id is None:
+            return
+
+        # Batch tracking data for bulk insert
+        if not hasattr(self, '_tracking_batch'):
+            self._tracking_batch = []
+            self._batch_size = 100  # Insert every 100 frames
+
+        frame_num = detections.frame_number
+        timestamp = frame_num / self.video_info.fps if self.video_info else 0
+
+        # Add player tracking data
+        for player in detections.players:
+            x1, y1, x2, y2 = player.bbox
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            self._tracking_batch.append({
+                'game_id': self._current_game_id,
+                'frame_number': frame_num,
+                'timestamp_seconds': timestamp,
+                'x': cx,
+                'y': cy,
+                'width': x2 - x1,
+                'height': y2 - y1,
+                'confidence': player.confidence,
+                'entity_type': 'player',
+                'team_id': player.team_id,
+                'tracker_id': player.tracker_id
+            })
+
+        # Add referee tracking data
+        for ref in detections.referees:
+            x1, y1, x2, y2 = ref.bbox
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            self._tracking_batch.append({
+                'game_id': self._current_game_id,
+                'frame_number': frame_num,
+                'timestamp_seconds': timestamp,
+                'x': cx,
+                'y': cy,
+                'width': x2 - x1,
+                'height': y2 - y1,
+                'confidence': ref.confidence,
+                'entity_type': 'referee',
+                'tracker_id': ref.tracker_id
+            })
+
+        # Add ball tracking data
+        if detections.ball:
+            ball = detections.ball
+            cx, cy = ball.center
+            self._tracking_batch.append({
+                'game_id': self._current_game_id,
+                'frame_number': frame_num,
+                'timestamp_seconds': timestamp,
+                'x': cx,
+                'y': cy,
+                'confidence': ball.confidence,
+                'entity_type': 'ball'
+            })
+
+        # Flush batch when full
+        if len(self._tracking_batch) >= self._batch_size:
+            self._flush_tracking_batch()
+
+    def _flush_tracking_batch(self):
+        """Flush accumulated tracking data to database"""
+        if not hasattr(self, '_tracking_batch') or not self._tracking_batch:
+            return
+
+        try:
+            with get_db_session() as session:
+                # Bulk insert for performance
+                session.execute(
+                    TrackingData.__table__.insert(),
+                    self._tracking_batch
+                )
+            logger.debug(f"Flushed {len(self._tracking_batch)} tracking records to database")
+        except Exception as e:
+            logger.warning(f"Failed to save tracking data: {e}")
+        finally:
+            self._tracking_batch = []
     
     def _complete_analysis_session(self, session_id: int, elapsed_seconds: float):
         """Mark analysis session as complete"""

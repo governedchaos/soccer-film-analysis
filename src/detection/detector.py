@@ -624,28 +624,32 @@ class SoccerDetector:
                 mean_color = np.mean(pixels, axis=0).astype(int)
                 return tuple(mean_color)
 
-            # Use K-means clustering to find dominant color (k=3 to handle variations)
-            pixels = valid_pixels.astype(np.float32)
+            # Fast histogram-based dominant color extraction (O(n) vs K-means O(n*k*i))
+            # Quantize colors to 8x8x8 bins (512 bins total) for speed
+            pixels = valid_pixels.astype(np.int32)
 
-            # K-means with k=3 clusters (sklearn version compatible)
-            from sklearn.cluster import KMeans
-            import sklearn
-            n_clusters = min(3, len(pixels))
+            # Quantize each channel to 8 levels (0-255 -> 0-7)
+            quantized = pixels // 32  # 256/32 = 8 levels per channel
 
-            sklearn_version = tuple(map(int, sklearn.__version__.split('.')[:2]))
-            if sklearn_version >= (1, 2):
-                kmeans = KMeans(
-                    n_clusters=n_clusters, n_init=3, random_state=42,
-                    max_iter=50, algorithm='lloyd'
-                )
+            # Create single index for each color bin: r*64 + g*8 + b
+            bin_indices = quantized[:, 0] * 64 + quantized[:, 1] * 8 + quantized[:, 2]
+
+            # Count occurrences of each bin
+            bin_counts = np.bincount(bin_indices, minlength=512)
+
+            # Find the most common bin
+            dominant_bin = np.argmax(bin_counts)
+
+            # Get all pixels that fall into this bin
+            mask = bin_indices == dominant_bin
+            dominant_pixels = pixels[mask]
+
+            if len(dominant_pixels) > 0:
+                # Return mean of pixels in dominant bin
+                dominant_color = np.mean(dominant_pixels, axis=0).astype(int)
             else:
-                kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42, max_iter=50)
-            kmeans.fit(pixels)
-
-            # Find the largest cluster (most common color)
-            labels, counts = np.unique(kmeans.labels_, return_counts=True)
-            dominant_idx = labels[np.argmax(counts)]
-            dominant_color = kmeans.cluster_centers_[dominant_idx].astype(int)
+                # Fallback to overall mean
+                dominant_color = np.mean(pixels, axis=0).astype(int)
 
             return tuple(dominant_color)
 
