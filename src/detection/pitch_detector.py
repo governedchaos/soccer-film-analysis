@@ -33,6 +33,40 @@ class PitchBoundary:
         return (self.min_x - margin <= x <= self.max_x + margin and
                 self.min_y - margin <= y <= self.max_y + margin)
 
+    def is_in_goal_area(self, x: float, y: float) -> bool:
+        """
+        Check if a point is likely in a goal area (left or right 12% of pitch).
+        Goalkeepers typically operate in this zone.
+        """
+        pitch_width = self.max_x - self.min_x
+        goal_zone_width = pitch_width * 0.12  # ~12% on each side
+
+        # Check if in left goal area
+        if self.min_x <= x <= self.min_x + goal_zone_width:
+            return True
+        # Check if in right goal area
+        if self.max_x - goal_zone_width <= x <= self.max_x:
+            return True
+        return False
+
+    def get_goal_areas(self) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
+        """
+        Get bounding boxes for estimated goal areas.
+        Returns: (left_goal_area, right_goal_area) as (x1, y1, x2, y2)
+        """
+        pitch_width = self.max_x - self.min_x
+        goal_zone_width = int(pitch_width * 0.12)
+
+        # Goal areas are typically in the center vertical portion
+        pitch_height = self.max_y - self.min_y
+        goal_y1 = self.min_y + int(pitch_height * 0.25)
+        goal_y2 = self.max_y - int(pitch_height * 0.25)
+
+        left_goal = (self.min_x, goal_y1, self.min_x + goal_zone_width, goal_y2)
+        right_goal = (self.max_x - goal_zone_width, goal_y1, self.max_x, goal_y2)
+
+        return left_goal, right_goal
+
     def contains_bbox(self, bbox: Tuple[float, float, float, float], threshold: float = 0.5) -> bool:
         """
         Check if a bounding box is mostly within the pitch.

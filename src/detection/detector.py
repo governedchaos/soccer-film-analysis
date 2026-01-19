@@ -481,23 +481,38 @@ class SoccerDetector:
         # Check if color matches goalkeeper colors
         for team_id, gk_color in self.goalkeeper_colors.items():
             distance = self._color_distance(dominant_color, gk_color)
-            if distance < 100:  # Increased threshold
-                logger.debug(f"Classified as GOALKEEPER: color distance {distance}")
+            logger.debug(f"GK color check: team={team_id}, color={dominant_color}, gk_color={gk_color}, distance={distance:.1f}")
+            if distance < 130:  # Increased threshold to match lighting variations
+                logger.info(f"Classified as GOALKEEPER: team={team_id}, color={dominant_color}, distance={distance:.1f}")
                 return "goalkeeper"
 
         # Position-based heuristic: goalkeepers are often near the edges
-        if self.field_bounds:
+        if self.field_bounds and dominant_color:
             x1, y1, x2, y2 = bbox
             cx = (x1 + x2) / 2
             field_x1, _, field_x2, _ = self.field_bounds
             field_width = field_x2 - field_x1
 
-            # If person is in the outer 15% of the field width, might be goalkeeper
-            edge_threshold = field_width * 0.15
-            if cx < field_x1 + edge_threshold or cx > field_x2 - edge_threshold:
-                # Additional check: is the color very different from typical player colors?
-                # This is a simple heuristic, real implementation would use learned classifier
-                pass
+            # If person is in the outer 12% of the field width (goal area), might be goalkeeper
+            edge_threshold = field_width * 0.12
+            in_goal_area = cx < field_x1 + edge_threshold or cx > field_x2 - edge_threshold
+
+            if in_goal_area:
+                # Check if color is very different from both team colors
+                # Goalkeepers typically wear distinct colors from their team
+                min_team_distance = float('inf')
+
+                if self.team_colors:
+                    for team_id, team_color in self.team_colors.items():
+                        if team_color:
+                            dist = self._color_distance(dominant_color, team_color)
+                            min_team_distance = min(min_team_distance, dist)
+
+                # If in goal area and color is very different from team colors, likely goalkeeper
+                if min_team_distance > 100:  # Significantly different from team colors
+                    logger.info(f"Classified as GOALKEEPER (position+color): in_goal_area=True, "
+                               f"color={dominant_color}, min_team_dist={min_team_distance:.1f}")
+                    return "goalkeeper"
 
         return "player"
 
@@ -1114,12 +1129,20 @@ def draw_detections(
             _draw_detection_box(annotated, ref, referee_color, draw_labels, prefix="REF")
     
     # Draw ball
-    if draw_ball and detections.ball:
-        ball = detections.ball
-        cx, cy = ball.center
-        cv2.circle(annotated, (int(cx), int(cy)), 10, ball_color, -1)
-        cv2.circle(annotated, (int(cx), int(cy)), 12, (255, 255, 255), 2)
-    
+    if draw_ball:
+        if detections.ball:
+            ball = detections.ball
+            cx, cy = ball.center
+            logger.debug(f"[DRAW] Drawing ball at ({int(cx)}, {int(cy)}) conf={ball.confidence:.2f}")
+            # Draw larger ball marker for visibility
+            cv2.circle(annotated, (int(cx), int(cy)), 15, ball_color, -1)
+            cv2.circle(annotated, (int(cx), int(cy)), 17, (255, 255, 255), 3)
+            # Add "BALL" label
+            cv2.putText(annotated, "BALL", (int(cx) - 20, int(cy) - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        else:
+            logger.debug(f"[DRAW] No ball in detections for frame {detections.frame_number}")
+
     return annotated
 
 
