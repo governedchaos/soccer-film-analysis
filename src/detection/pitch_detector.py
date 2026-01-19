@@ -468,3 +468,114 @@ class PitchDetector:
         )
 
         return annotated
+
+    def detect_goal_posts(self, frame: np.ndarray) -> List[Dict]:
+        """
+        Detect goal posts using white vertical line detection.
+
+        Goal posts are white vertical structures at the far left/right of the pitch.
+        Uses color filtering + line detection in goal areas.
+
+        Returns:
+            List of detected goal posts with 'side' ('left'/'right'), 'bbox', 'confidence'
+        """
+        if self._cached_boundary is None:
+            return []
+
+        goals = []
+        height, width = frame.shape[:2]
+        boundary = self._cached_boundary
+
+        # Get goal areas
+        left_goal_area, right_goal_area = boundary.get_goal_areas()
+
+        for side, goal_area in [('left', left_goal_area), ('right', right_goal_area)]:
+            x1, y1, x2, y2 = goal_area
+
+            # Ensure bounds are within frame
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(width, x2)
+            y2 = min(height, y2)
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            # Extract goal area ROI
+            roi = frame[y1:y2, x1:x2]
+
+            # Detect white regions (goal posts are white)
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            _, white_mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+
+            # Detect vertical lines
+            edges = cv2.Canny(white_mask, 50, 150)
+            lines = cv2.HoughLinesP(
+                edges,
+                rho=1,
+                theta=np.pi / 180,
+                threshold=30,
+                minLineLength=30,
+                maxLineGap=10
+            )
+
+            if lines is not None:
+                # Find vertical lines (goal posts)
+                vertical_lines = []
+                for line in lines:
+                    lx1, ly1, lx2, ly2 = line[0]
+                    # Check if line is mostly vertical (angle > 70 degrees)
+                    dx = abs(lx2 - lx1)
+                    dy = abs(ly2 - ly1)
+                    if dy > 0 and dx / dy < 0.4:  # More vertical than horizontal
+                        vertical_lines.append(line[0])
+
+                if vertical_lines:
+                    # Find the tallest vertical line (likely the post)
+                    best_line = max(vertical_lines, key=lambda l: abs(l[3] - l[1]))
+                    lx1, ly1, lx2, ly2 = best_line
+
+                    # Convert back to frame coordinates
+                    post_x = x1 + (lx1 + lx2) // 2
+                    post_y1 = y1 + min(ly1, ly2)
+                    post_y2 = y1 + max(ly1, ly2)
+
+                    goals.append({
+                        'side': side,
+                        'bbox': (post_x - 5, post_y1, post_x + 5, post_y2),
+                        'confidence': 0.7,
+                        'line': (post_x, post_y1, post_x, post_y2)
+                    })
+
+        logger.debug(f"Detected {len(goals)} goal posts")
+        return goals
+
+    def draw_goals(self, frame: np.ndarray) -> np.ndarray:
+        """Draw detected goals on frame."""
+        annotated = frame.copy()
+
+        goals = self.detect_goal_posts(frame)
+
+        for goal in goals:
+            x1, y1, x2, y2 = goal['bbox']
+            side = goal['side']
+
+            # Draw goal post as cyan rectangle
+            cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (255, 255, 0), 3)
+
+            # Label
+            label = f"GOAL ({side})"
+            cv2.putText(
+                annotated, label, (int(x1), int(y1) - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2
+            )
+
+        # Also draw goal areas
+        if self._cached_boundary:
+            left_area, right_area = self._cached_boundary.get_goal_areas()
+
+            for area, label in [(left_area, "L-GOAL"), (right_area, "R-GOAL")]:
+                ax1, ay1, ax2, ay2 = area
+                cv2.rectangle(annotated, (ax1, ay1), (ax2, ay2), (0, 200, 200), 1)
+
+        return annotated
