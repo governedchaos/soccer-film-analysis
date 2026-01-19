@@ -451,6 +451,27 @@ class MainWindow(QMainWindow):
         load_state_action.triggered.connect(self._load_analysis_state)
         settings_menu.addAction(load_state_action)
 
+        # View menu
+        view_menu = menubar.addMenu("&View")
+
+        self.debug_mode_action = QAction("&Debug Mode", self)
+        self.debug_mode_action.setCheckable(True)
+        self.debug_mode_action.setChecked(False)
+        self.debug_mode_action.triggered.connect(self._toggle_debug_mode)
+        view_menu.addAction(self.debug_mode_action)
+
+        self.show_log_action = QAction("Show &Log Panel", self)
+        self.show_log_action.setCheckable(True)
+        self.show_log_action.setChecked(True)
+        self.show_log_action.triggered.connect(self._toggle_log_panel)
+        view_menu.addAction(self.show_log_action)
+
+        view_menu.addSeparator()
+
+        export_logs_action = QAction("&Export Debug Logs...", self)
+        export_logs_action.triggered.connect(self._export_debug_logs)
+        view_menu.addAction(export_logs_action)
+
         # Help menu
         help_menu = menubar.addMenu("&Help")
 
@@ -666,6 +687,62 @@ class MainWindow(QMainWindow):
         """Toggle the debug log panel visibility"""
         self.log_panel.setVisible(checked)
         self.log_toggle_btn.setText("Hide Debug Log" if checked else "Show Debug Log")
+
+    def _toggle_debug_mode(self, checked: bool):
+        """Toggle debug logging level"""
+        import sys
+        from loguru import logger
+
+        # Remove existing handlers and add new one with appropriate level
+        logger.remove()
+        level = "DEBUG" if checked else "INFO"
+        logger.add(sys.stderr, level=level, format="{time:HH:mm:ss} | {level:<7} | {message}")
+
+        self.log_message(f"Debug mode {'enabled' if checked else 'disabled'} (log level: {level})", "INFO")
+
+        # Update status bar
+        if checked:
+            self.status_bar.showMessage("Debug mode enabled - verbose logging active")
+        else:
+            self.status_bar.showMessage("Debug mode disabled")
+
+    def _export_debug_logs(self):
+        """Export debug logs to a file"""
+        from datetime import datetime
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Debug Logs",
+            f"soccer_analysis_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            "Text Files (*.txt);;All Files (*)"
+        )
+
+        if not filepath:
+            return
+
+        try:
+            # Get log content from log panel
+            log_content = self.log_panel.toPlainText() if hasattr(self.log_panel, 'toPlainText') else ""
+
+            # Add header with system info
+            from config.settings import settings
+            header = f"""Soccer Film Analysis - Debug Log Export
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Device: {settings.device}
+GPU Available: {settings.gpu_available}
+{'='*60}
+
+"""
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(header)
+                f.write(log_content)
+
+            self.log_message(f"Logs exported to: {filepath}", "INFO")
+            QMessageBox.information(self, "Export Complete", f"Debug logs exported to:\n{filepath}")
+
+        except Exception as e:
+            self.log_message(f"Failed to export logs: {e}", "ERROR")
+            QMessageBox.warning(self, "Export Failed", f"Failed to export logs:\n{e}")
 
     def log_message(self, message: str, level: str = "INFO"):
         """Add message to log panel"""

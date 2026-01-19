@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict, Any
-from collections import defaultdict
+from collections import defaultdict, deque
 from loguru import logger
 
 from .detector import (
@@ -122,8 +122,8 @@ class EnhancedDetector(SoccerDetector):
         # Auto-detected referee colors
         self.auto_referee_colors: List[Tuple[int, int, int]] = []
 
-        # Ball tracking history for interpolation
-        self.ball_history: List[Tuple[int, float, float]] = []  # (frame, x, y)
+        # Ball tracking history for interpolation (deque for O(1) append/trim)
+        self.ball_history: deque = deque(maxlen=90)  # (frame, x, y) - 3 seconds at 30fps
 
         # Statistics
         self.stats = {
@@ -175,7 +175,7 @@ class EnhancedDetector(SoccerDetector):
         )
 
         # Filter out-of-bounds detections
-        results = self._filter_out_of_bounds(results)
+        results = self._filter_out_of_bounds(results, frame)
 
         # Improve referee detection
         results = self._enhance_referee_detection(frame, results)
@@ -187,25 +187,31 @@ class EnhancedDetector(SoccerDetector):
         if results.ball is None:
             results.ball = self._detect_ball_fallback(frame, frame_number)
 
-        # Update ball history
+        # Update ball history (deque auto-trims to maxlen=90)
         if results.ball is not None:
             cx, cy = results.ball.center
             self.ball_history.append((frame_number, cx, cy))
-            if len(self.ball_history) > 90:  # 3 seconds at 30fps
-                self.ball_history = self.ball_history[-90:]
 
         # Update statistics
         self.stats['total_frames'] += 1
 
         return results
 
-    def _filter_out_of_bounds(self, results: FrameDetections) -> FrameDetections:
+    def _filter_out_of_bounds(self, results: FrameDetections, frame: np.ndarray = None) -> FrameDetections:
         """Filter detections that are outside the pitch boundary."""
         boundary = self.pitch_detector._cached_boundary
 
+        # Get frame dimensions from actual frame if available
+        if frame is not None:
+            frame_height, frame_width = frame.shape[:2]
+        else:
+            # Use typical HD dimensions as fallback
+            frame_height = 1080
+            frame_width = 1920
+
         # Additional heuristic: filter based on frame position
         # Sideline people are typically at very top/bottom or far left/right edges
-        def is_likely_sideline_or_bench(bbox, frame_height, frame_width):
+        def is_likely_sideline_or_bench(bbox):
             x1, y1, x2, y2 = bbox
             cx = (x1 + x2) / 2
             cy = (y1 + y2) / 2
@@ -245,20 +251,11 @@ class EnhancedDetector(SoccerDetector):
 
             return False
 
-        # Get frame dimensions from boundary or use defaults
-        if boundary:
-            frame_height = boundary.max_y + boundary.min_y  # Approximate
-            frame_width = boundary.max_x + boundary.min_x
-        else:
-            # Use typical HD dimensions as fallback
-            frame_height = 1080
-            frame_width = 1920
-
         # Filter players
         filtered_players = []
         for player in results.players:
             # First check sideline heuristics
-            if is_likely_sideline_or_bench(player.bbox, frame_height, frame_width):
+            if is_likely_sideline_or_bench(player.bbox):
                 continue
             # Then check pitch boundary
             if boundary is None or boundary.contains_bbox(player.bbox):
@@ -271,7 +268,7 @@ class EnhancedDetector(SoccerDetector):
         # Filter goalkeepers (they should be on pitch too)
         filtered_gks = []
         for gk in results.goalkeepers:
-            if is_likely_sideline_or_bench(gk.bbox, frame_height, frame_width):
+            if is_likely_sideline_or_bench(gk.bbox):
                 continue
             if boundary is None or boundary.contains_bbox(gk.bbox):
                 filtered_gks.append(gk)
@@ -281,7 +278,7 @@ class EnhancedDetector(SoccerDetector):
         # Referees can be on or slightly off pitch
         filtered_refs = []
         for ref in results.referees:
-            if is_likely_sideline_or_bench(ref.bbox, frame_height, frame_width):
+            if is_likely_sideline_or_bench(ref.bbox):
                 continue
             if boundary is None:
                 filtered_refs.append(ref)
@@ -519,8 +516,9 @@ class EnhancedDetector(SoccerDetector):
         if len(self.ball_history) < 2:
             return None
 
-        # Get last two known positions
-        recent = self.ball_history[-5:]
+        # Get last few known positions (convert deque slice to list)
+        history_list = list(self.ball_history)
+        recent = history_list[-5:] if len(history_list) >= 5 else history_list
 
         # Check if positions are recent enough
         last_frame, last_x, last_y = recent[-1]

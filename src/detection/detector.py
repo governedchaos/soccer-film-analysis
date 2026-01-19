@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
+from collections import OrderedDict
 from pathlib import Path
 from loguru import logger
 
@@ -188,7 +189,9 @@ class SoccerDetector:
 
         # Color cache for tracked players (tracker_id -> dominant_color)
         # Avoids expensive color extraction for players we've already classified
-        self._color_cache: Dict[int, Tuple[int, int, int]] = {}
+        # Uses OrderedDict with LRU eviction (max 30 entries for 22 players + refs + margin)
+        self._color_cache: OrderedDict[int, Tuple[int, int, int]] = OrderedDict()
+        self._color_cache_max_size = 30
         self._color_cache_hits = 0
         self._color_cache_misses = 0
 
@@ -332,14 +335,18 @@ class SoccerDetector:
             dominant_color = None
             if class_id == self.COCO_PERSON:
                 if tracker_id is not None and tracker_id in self._color_cache:
-                    # Cache hit - reuse previously extracted color
+                    # Cache hit - reuse previously extracted color (move to end for LRU)
                     dominant_color = self._color_cache[tracker_id]
+                    self._color_cache.move_to_end(tracker_id)
                     self._color_cache_hits += 1
                 else:
                     # Cache miss - extract color and cache it
                     dominant_color = self._extract_dominant_color(frame, bbox)
                     self._color_cache_misses += 1
                     if tracker_id is not None and dominant_color is not None:
+                        # LRU eviction - remove oldest if at capacity
+                        if len(self._color_cache) >= self._color_cache_max_size:
+                            self._color_cache.popitem(last=False)
                         self._color_cache[tracker_id] = dominant_color
 
             # Handle ball detection
