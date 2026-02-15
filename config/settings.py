@@ -5,12 +5,15 @@ Uses Pydantic for type-safe configuration management
 
 import os
 import json
+import logging
 from pathlib import Path
 from typing import Literal, Optional, Dict, Any
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from enum import Enum
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 class AnalysisDepth(str, Enum):
@@ -508,7 +511,7 @@ class ConfigPersistence:
                 json.dump(config_with_meta, f, indent=2)
             return True
         except Exception as e:
-            print(f"Failed to save config: {e}")
+            logger.error("Failed to save config: %s", e)
             return False
 
     def load_user_config(self) -> Dict[str, Any]:
@@ -529,7 +532,7 @@ class ConfigPersistence:
             config.pop("_version", None)
             return config
         except Exception as e:
-            print(f"Failed to load config: {e}")
+            logger.error("Failed to load config: %s", e)
             return {}
 
     def save_recent_files(self, recent_files: list) -> bool:

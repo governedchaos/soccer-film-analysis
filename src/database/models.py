@@ -13,7 +13,11 @@ from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.pool import QueuePool
 import enum
 
+import logging
+
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 # Create base class for models
 Base = declarative_base()
@@ -484,14 +488,14 @@ def init_database():
     """Initialize database - create all tables"""
     engine = get_engine()
     Base.metadata.create_all(engine)
-    print(f"Database initialized: {settings.db_name}")
+    logger.info("Database initialized: %s", settings.db_name)
 
 
 def drop_database():
     """Drop all tables - USE WITH CAUTION"""
     engine = get_engine()
     Base.metadata.drop_all(engine)
-    print(f"Database tables dropped: {settings.db_name}")
+    logger.warning("Database tables dropped: %s", settings.db_name)
 
 
 # Context manager for sessions
