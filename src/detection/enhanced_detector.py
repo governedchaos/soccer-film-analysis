@@ -30,7 +30,17 @@ REFEREE_COLORS = {
 
 @dataclass
 class TrackedPerson:
-    """Persistent tracking info for a detected person."""
+    """Persistent tracking info for a detected person.
+
+    Tracks team and role assignments over time and stabilises them via
+    majority voting.  Once stable, assignments are locked — a player
+    classified as "player on team X" for 5+ frames won't be reclassified
+    as a referee unless the tracker disappears and reappears.
+
+    Goalkeepers are locked even more aggressively: once a person is stably
+    classified as GK, they remain GK for the rest of the match (GKs rarely
+    change in-game).
+    """
     tracker_id: int
     team_history: List[int] = field(default_factory=list)
     role_history: List[str] = field(default_factory=list)  # "player", "referee", "goalkeeper"
@@ -38,6 +48,9 @@ class TrackedPerson:
     last_seen_frame: int = 0
     stable_team: Optional[int] = None
     stable_role: Optional[str] = None
+
+    # Once True, the role is permanently locked (for GKs)
+    role_locked: bool = False
 
     def add_observation(
         self,
@@ -51,8 +64,13 @@ class TrackedPerson:
 
         if team_id is not None:
             self.team_history.append(team_id)
-        if role:
+
+        # If role is locked, ignore incoming role changes
+        if self.role_locked:
+            self.role_history.append(self.stable_role or role)
+        elif role:
             self.role_history.append(role)
+
         if color:
             self.color_history.append(color)
 
@@ -66,23 +84,31 @@ class TrackedPerson:
         self._update_stable_assignments()
 
     def _update_stable_assignments(self):
-        """Update stable team/role based on history."""
-        # Need enough history
-        if len(self.team_history) >= 10:
-            # Use majority vote for team
+        """Update stable team/role based on history (5-frame threshold)."""
+
+        # ---- Team stability ----
+        if len(self.team_history) >= 5:
             team_counts = defaultdict(int)
             for t in self.team_history[-30:]:
                 team_counts[t] += 1
             if team_counts:
                 self.stable_team = max(team_counts.items(), key=lambda x: x[1])[0]
 
-        if len(self.role_history) >= 10:
-            # Use majority vote for role
+        # ---- Role stability ----
+        if self.role_locked:
+            return  # Already permanently locked
+
+        if len(self.role_history) >= 5:
             role_counts = defaultdict(int)
             for r in self.role_history[-30:]:
                 role_counts[r] += 1
             if role_counts:
-                self.stable_role = max(role_counts.items(), key=lambda x: x[1])[0]
+                best_role = max(role_counts.items(), key=lambda x: x[1])[0]
+                self.stable_role = best_role
+
+                # Lock goalkeeper role permanently once stable
+                if best_role == "goalkeeper":
+                    self.role_locked = True
 
     def get_team(self) -> Optional[int]:
         """Get the most likely team assignment."""
@@ -107,7 +133,7 @@ class EnhancedDetector(SoccerDetector):
     - Improved referee detection
     - Consistent team assignment using tracking
     - Pitch boundary filtering
-    - Better ball detection
+    - Better ball detection with Kalman filter
     """
 
     def __init__(self, *args, **kwargs):
@@ -122,8 +148,16 @@ class EnhancedDetector(SoccerDetector):
         # Auto-detected referee colors
         self.auto_referee_colors: List[Tuple[int, int, int]] = []
 
-        # Ball tracking history for interpolation (deque for O(1) append/trim)
+        # Ball tracking history (deque for O(1) append/trim)
         self.ball_history: deque = deque(maxlen=90)  # (frame, x, y) - 3 seconds at 30fps
+
+        # Kalman filter for ball tracking
+        self._ball_kalman = self._create_ball_kalman()
+        self._kalman_initialized = False
+        self._kalman_frames_without_measurement = 0
+        self._kalman_max_predict_frames = 30  # Predict for up to 1 second (30fps)
+        # Kalman prediction is accessed by parent's _select_best_ball()
+        self._kalman_prediction: Optional[Tuple[float, float]] = None
 
         # Statistics
         self.stats = {
@@ -136,6 +170,44 @@ class EnhancedDetector(SoccerDetector):
 
         # Initialize with common referee colors
         self._init_referee_colors()
+
+    @staticmethod
+    def _create_ball_kalman() -> cv2.KalmanFilter:
+        """Create a Kalman filter for ball position tracking.
+
+        State: [x, y, vx, vy]  (position + velocity)
+        Measurement: [x, y]     (position only)
+        """
+        kf = cv2.KalmanFilter(4, 2)  # 4 state vars, 2 measurement vars
+
+        # Transition matrix (constant velocity model):
+        # x'  = x + vx*dt  (dt=1 frame)
+        # y'  = y + vy*dt
+        # vx' = vx
+        # vy' = vy
+        kf.transitionMatrix = np.array([
+            [1, 0, 1, 0],
+            [0, 1, 0, 1],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ], dtype=np.float32)
+
+        # Measurement matrix: we only observe [x, y]
+        kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+        ], dtype=np.float32)
+
+        # Process noise (how much we trust the model vs measurements)
+        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 5.0
+
+        # Measurement noise (how noisy the YOLO detections are)
+        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 10.0
+
+        # Initial state covariance (high uncertainty)
+        kf.errorCovPost = np.eye(4, dtype=np.float32) * 100.0
+
+        return kf
 
     def _init_referee_colors(self):
         """Initialize with common referee colors."""
@@ -163,13 +235,22 @@ class EnhancedDetector(SoccerDetector):
         track_objects: bool = True,
         confidence_threshold: Optional[float] = None
     ) -> FrameDetections:
-        """Enhanced detection with pitch filtering and persistent tracking."""
+        """Enhanced detection with pitch filtering, persistent tracking, and Kalman ball filter."""
 
         # First, detect pitch boundary
         if detect_pitch:
             self.pitch_detector.detect(frame, frame_number)
 
-        # Run base detection
+        # ---- Kalman prediction BEFORE base detection ----
+        # This makes the prediction available to _select_best_ball() in the parent class.
+        if self._kalman_initialized:
+            predicted = self._ball_kalman.predict()
+            pred_x, pred_y = float(predicted[0]), float(predicted[1])
+            self._kalman_prediction = (pred_x, pred_y)
+        else:
+            self._kalman_prediction = None
+
+        # Run base detection (uses _kalman_prediction for best-ball selection)
         results = super().detect_frame(
             frame, frame_number, fps, False, track_objects, confidence_threshold
         )
@@ -183,14 +264,56 @@ class EnhancedDetector(SoccerDetector):
         # Apply persistent team assignments
         results = self._apply_persistent_tracking(frame_number, results)
 
-        # Enhance ball detection if missing
-        if results.ball is None:
-            results.ball = self._detect_ball_fallback(frame, frame_number)
-
-        # Update ball history (deque auto-trims to maxlen=90)
+        # ---- Kalman filter update ----
         if results.ball is not None:
             cx, cy = results.ball.center
+            measurement = np.array([[np.float32(cx)], [np.float32(cy)]])
+
+            if not self._kalman_initialized:
+                # First detection — initialize Kalman state
+                self._ball_kalman.statePost = np.array(
+                    [[np.float32(cx)], [np.float32(cy)], [0.0], [0.0]],
+                    dtype=np.float32
+                )
+                self._kalman_initialized = True
+            else:
+                # Correct with measurement
+                self._ball_kalman.correct(measurement)
+
+            self._kalman_frames_without_measurement = 0
             self.ball_history.append((frame_number, cx, cy))
+        else:
+            # No ball detected — try Kalman prediction as fallback
+            self._kalman_frames_without_measurement += 1
+
+            if (self._kalman_initialized and
+                    self._kalman_frames_without_measurement <= self._kalman_max_predict_frames):
+                # Use Kalman prediction (already computed above)
+                if self._kalman_prediction is not None:
+                    pred_x, pred_y = self._kalman_prediction
+                    # Clamp to frame bounds
+                    h, w = frame.shape[:2]
+                    pred_x = max(0, min(pred_x, w))
+                    pred_y = max(0, min(pred_y, h))
+
+                    size = 12
+                    results.ball = BallDetection(
+                        bbox=(pred_x - size, pred_y - size,
+                              pred_x + size, pred_y + size),
+                        confidence=max(0.1, 0.4 - 0.01 * self._kalman_frames_without_measurement),
+                        class_id=32,
+                        class_name="ball_predicted",
+                        tracker_id=None
+                    )
+                    self.ball_history.append((frame_number, pred_x, pred_y))
+            elif self._kalman_frames_without_measurement > self._kalman_max_predict_frames:
+                # Lost the ball for too long — reset Kalman
+                self._kalman_initialized = False
+                self._ball_kalman = self._create_ball_kalman()
+
+            # Last resort: color-based fallback
+            if results.ball is None:
+                results.ball = self._detect_ball_by_color(frame)
 
         # Update statistics
         self.stats['total_frames'] += 1
@@ -343,11 +466,11 @@ class EnhancedDetector(SoccerDetector):
 
         r, g, b = color
 
-        # Check against known referee colors with TIGHT threshold
+        # Check against known referee colors with TIGHT LAB threshold
         # Only match if very close to a known referee color
         for ref_color in ref_colors:
             distance = self._color_distance(color, ref_color)
-            if distance < 50:  # Tight match - must be close to actual ref color
+            if distance < 35:  # Tight LAB match - must be close to actual ref color
                 return True
 
         # DO NOT use heuristics for dark colors - they match shadows/skin tones
@@ -360,16 +483,24 @@ class EnhancedDetector(SoccerDetector):
         frame_number: int,
         results: FrameDetections
     ) -> FrameDetections:
-        """Apply persistent team assignments based on tracking history."""
+        """
+        Apply persistent team/role assignments based on tracking history.
 
-        # Process players
+        Key behaviours:
+        - Once a tracker_id is stably classified as "player" on team X,
+          it stays that way even if a single frame's color is ambiguous.
+        - If a player was classified as referee but their stable role is
+          "player", move them back to the players list.
+        - Goalkeepers are locked permanently once stable (5+ frames).
+        """
+
+        # ---------- Process players ----------
         for player in results.players:
             if player.tracker_id is None:
                 continue
 
             tid = player.tracker_id
 
-            # Get or create tracked person
             if tid not in self.tracked_persons:
                 self.tracked_persons[tid] = TrackedPerson(tracker_id=tid)
 
@@ -388,12 +519,27 @@ class EnhancedDetector(SoccerDetector):
             if stable_team is not None:
                 player.team_id = stable_team
 
-            # Check if this should be a referee based on history
-            if tracked.stable_role == "referee":
-                player.is_referee = True
+        # ---------- Process goalkeepers ----------
+        for gk in results.goalkeepers:
+            if gk.tracker_id is None:
+                continue
 
-        # Process referees
-        for ref in results.referees:
+            tid = gk.tracker_id
+
+            if tid not in self.tracked_persons:
+                self.tracked_persons[tid] = TrackedPerson(tracker_id=tid)
+
+            tracked = self.tracked_persons[tid]
+            tracked.add_observation(
+                frame=frame_number,
+                team_id=gk.team_id,
+                role="goalkeeper",
+                color=gk.dominant_color
+            )
+
+        # ---------- Process referees ----------
+        refs_to_move_back = []
+        for i, ref in enumerate(results.referees):
             if ref.tracker_id is None:
                 continue
 
@@ -410,7 +556,42 @@ class EnhancedDetector(SoccerDetector):
                 color=ref.dominant_color
             )
 
-        # Clean up old tracked persons
+            # If this tracker's stable role is actually "player", move it back
+            if tracked.stable_role == "player":
+                logger.debug(f"Tracker {tid} stable role is 'player' — "
+                            f"moving back from referees list")
+                ref.is_referee = False
+                ref.class_name = "player"
+                # Give it the stable team
+                stable_team = tracked.get_team()
+                if stable_team is not None:
+                    ref.team_id = stable_team
+                refs_to_move_back.append(i)
+
+        # Move mis-classified referees back to players
+        for i in sorted(refs_to_move_back, reverse=True):
+            moved_player = results.referees.pop(i)
+            results.players.append(moved_player)
+
+        # ---------- Apply stable role overrides for players ----------
+        players_to_move = []
+        for i, player in enumerate(results.players):
+            if player.tracker_id is None:
+                continue
+            tid = player.tracker_id
+            if tid in self.tracked_persons:
+                tracked = self.tracked_persons[tid]
+                # If stably a goalkeeper, move to goalkeepers list
+                if tracked.stable_role == "goalkeeper":
+                    player.is_goalkeeper = True
+                    player.class_name = "goalkeeper"
+                    players_to_move.append(i)
+
+        for i in sorted(players_to_move, reverse=True):
+            moved_gk = results.players.pop(i)
+            results.goalkeepers.append(moved_gk)
+
+        # ---------- Clean up old tracked persons ----------
         stale_threshold = frame_number - 300  # 10 seconds at 30fps
         stale_ids = [
             tid for tid, tracked in self.tracked_persons.items()
@@ -559,7 +740,7 @@ class EnhancedDetector(SoccerDetector):
                 # Add to auto-detected colors if not already present
                 is_new = True
                 for existing in self.auto_referee_colors:
-                    if self._color_distance(ref.dominant_color, existing) < 50:
+                    if self._color_distance(ref.dominant_color, existing) < 30:
                         is_new = False
                         break
 
@@ -631,6 +812,13 @@ class EnhancedDetector(SoccerDetector):
         self.tracked_persons.clear()
         self.ball_history.clear()
         self.pitch_detector.reset()
+
+        # Reset Kalman filter
+        self._ball_kalman = self._create_ball_kalman()
+        self._kalman_initialized = False
+        self._kalman_frames_without_measurement = 0
+        self._kalman_prediction = None
+
         self.stats = {
             'home_possession_frames': 0,
             'away_possession_frames': 0,

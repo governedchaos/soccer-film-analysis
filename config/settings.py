@@ -111,6 +111,27 @@ class Settings(BaseSettings):
     frame_sample_quick: int = Field(default=10, description="Frame sample rate for quick analysis")
     frame_sample_standard: int = Field(default=5, description="Frame sample rate for standard analysis")
     frame_sample_deep: int = Field(default=2, description="Frame sample rate for deep analysis")
+
+    # Inference resolution: downscale frames before YOLO inference for speed.
+    # Detection bboxes are mapped back to original resolution automatically.
+    # 0 = no downscaling (use original resolution). Recommended: 640 for CPU, 960 for GPU.
+    inference_resolution: int = Field(
+        default=0,
+        ge=0,
+        description="Max width for YOLO inference (0 = original resolution)"
+    )
+
+    # Auto-select YOLO model size based on hardware
+    yolo_model_size_cpu: str = Field(
+        default="nano",
+        description="YOLO model size when running on CPU (nano is 2x faster than small)"
+    )
+
+    # Simplified annotations for faster playback
+    simplified_annotations: bool = Field(
+        default=False,
+        description="Use dots instead of rectangles+text for faster rendering"
+    )
     
     # ==========================================
     # Paths
@@ -220,6 +241,26 @@ class Settings(BaseSettings):
             AnalysisDepth.DEEP: self.frame_sample_deep,
         }
         return rates.get(depth, self.frame_sample_standard)
+
+    def get_effective_inference_resolution(self) -> int:
+        """Get the effective inference resolution, auto-selecting if not set."""
+        if self.inference_resolution > 0:
+            return self.inference_resolution
+        # Auto-select based on device
+        device = self.get_device()
+        if device == "cpu":
+            return 640  # Much faster on CPU
+        elif device == "mps":
+            return 960  # Good balance for Apple Silicon
+        else:
+            return 0  # CUDA can handle full res
+
+    def get_effective_yolo_model_size(self) -> str:
+        """Get the YOLO model size, auto-selecting based on hardware."""
+        device = self.get_device()
+        if device == "cpu":
+            return self.yolo_model_size_cpu
+        return self.yolo_model_size
     
     def get_device(self) -> str:
         """Get the compute device (cuda, mps, or cpu)"""

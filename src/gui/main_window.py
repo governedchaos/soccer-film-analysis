@@ -117,7 +117,11 @@ class GameConfigDialog(QDialog):
 
         colors_layout.addWidget(QLabel("Referees:"), 4, 0)
         self.referee_color = ColorButton((0, 0, 0))  # Black
+        colors_layout.addWidget(QLabel("Primary"), 4, 1)
         colors_layout.addWidget(self.referee_color, 4, 2)
+        self.referee_color_2 = ColorButton((255, 255, 0))  # Yellow (common alt ref kit)
+        colors_layout.addWidget(QLabel("Secondary"), 4, 3)
+        colors_layout.addWidget(self.referee_color_2, 4, 4)
 
         colors_group.setLayout(colors_layout)
         scroll_layout.addWidget(colors_group)
@@ -169,7 +173,11 @@ class GameConfigDialog(QDialog):
                 "secondary_color": self.away_secondary_color.get_color(),
                 "goalkeeper_color": self.away_gk_color.get_color(),
             },
-            "referee_color": self.referee_color.get_color(),
+            "referee_colors": [
+                self.referee_color.get_color(),
+                self.referee_color_2.get_color(),
+            ],
+            "referee_color": self.referee_color.get_color(),  # Legacy compatibility
             "competition": self.competition.text(),
             "venue": self.venue.text(),
             "detection": {
@@ -202,8 +210,14 @@ class GameConfigDialog(QDialog):
             if "goalkeeper_color" in away:
                 self.away_gk_color.set_color(away["goalkeeper_color"])
 
-        # Referee color
-        if "referee_color" in config:
+        # Referee colors (supports both new multi-color and legacy single color)
+        if "referee_colors" in config:
+            ref_colors = config["referee_colors"]
+            if len(ref_colors) >= 1:
+                self.referee_color.set_color(ref_colors[0])
+            if len(ref_colors) >= 2:
+                self.referee_color_2.set_color(ref_colors[1])
+        elif "referee_color" in config:
             self.referee_color.set_color(config["referee_color"])
 
         # Game info
@@ -770,9 +784,17 @@ GPU Available: {settings.gpu_available}
 
         # Apply referee and goalkeeper colors
         if self.processor.detector:
-            ref_color = self._game_config.get("referee_color")
-            if ref_color:
-                self.processor.detector.set_referee_colors([ref_color])
+            # Support multi-color referee specification
+            ref_colors_list = self._game_config.get("referee_colors", [])
+            if not ref_colors_list:
+                # Legacy fallback: single referee color
+                ref_color = self._game_config.get("referee_color")
+                if ref_color:
+                    ref_colors_list = [ref_color]
+            # Filter out None/empty colors
+            ref_colors_list = [c for c in ref_colors_list if c]
+            if ref_colors_list:
+                self.processor.detector.set_referee_colors(ref_colors_list)
 
             home_gk = self._game_config["home_team"].get("goalkeeper_color")
             away_gk = self._game_config["away_team"].get("goalkeeper_color")

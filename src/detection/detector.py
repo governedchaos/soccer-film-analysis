@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 from loguru import logger
 
@@ -145,7 +145,7 @@ class SoccerDetector:
 
     def __init__(
         self,
-        model_size: str = "small",
+        model_size: Optional[str] = None,
         device: Optional[str] = None,
         models_dir: Optional[Path] = None
     ):
@@ -154,6 +154,7 @@ class SoccerDetector:
 
         Args:
             model_size: YOLO model size - "nano", "small", "medium", "large", "xlarge"
+                       If None, auto-selects based on hardware (nano for CPU, configured size for GPU)
             device: Compute device (cuda, mps, cpu) - auto-detected if None
             models_dir: Directory to store downloaded models
         """
@@ -161,7 +162,8 @@ class SoccerDetector:
             raise ImportError("Ultralytics YOLO not installed. Run: pip install ultralytics")
 
         self.device = device or settings.get_device()
-        self.model_size = model_size
+        # Auto-select model size based on hardware if not explicitly specified
+        self.model_size = model_size or settings.get_effective_yolo_model_size()
         self.models_dir = models_dir or settings.get_models_dir()
 
         # Get model filename
@@ -187,11 +189,13 @@ class SoccerDetector:
         # Field boundary for position-based classification
         self.field_bounds: Optional[Tuple[int, int, int, int]] = None  # x1, y1, x2, y2
 
-        # Color cache for tracked players (tracker_id -> dominant_color)
-        # Avoids expensive color extraction for players we've already classified
-        # Uses OrderedDict with LRU eviction (max 30 entries for 22 players + refs + margin)
-        self._color_cache: OrderedDict[int, Tuple[int, int, int]] = OrderedDict()
+        # Multi-observation color cache for tracked players.
+        # Stores the last N color observations per tracker_id and returns the
+        # median color, which smooths out frame-to-frame lighting variations.
+        # tracker_id -> deque of RGB tuples (max 5 observations)
+        self._color_cache: OrderedDict[int, deque] = OrderedDict()
         self._color_cache_max_size = 30
+        self._color_cache_obs_count = 5  # Observations to store per tracker
         self._color_cache_hits = 0
         self._color_cache_misses = 0
 
@@ -247,6 +251,52 @@ class SoccerDetector:
             )
         return self._tracker
     
+    def _downscale_for_inference(
+        self,
+        frame: np.ndarray
+    ) -> Tuple[np.ndarray, float]:
+        """
+        Downscale frame for faster YOLO inference if inference_resolution is set.
+
+        Args:
+            frame: Original BGR frame
+
+        Returns:
+            (possibly_resized_frame, scale_factor)
+            scale_factor is original_width / resized_width (>= 1.0)
+        """
+        inference_res = settings.get_effective_inference_resolution()
+        if inference_res <= 0 or frame.shape[1] <= inference_res:
+            return frame, 1.0
+
+        original_w = frame.shape[1]
+        scale = inference_res / original_w
+        new_w = inference_res
+        new_h = int(frame.shape[0] * scale)
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        return resized, original_w / new_w
+
+    def _scale_detections_back(
+        self,
+        detections: Any,
+        scale_factor: float
+    ) -> Any:
+        """
+        Scale detection bounding boxes back to original resolution.
+
+        Args:
+            detections: sv.Detections object
+            scale_factor: Factor to multiply coordinates by (original / resized)
+
+        Returns:
+            Detections with scaled bounding boxes
+        """
+        if scale_factor == 1.0 or detections is None:
+            return detections
+        if hasattr(detections, 'xyxy') and len(detections) > 0:
+            detections.xyxy = detections.xyxy * scale_factor
+        return detections
+
     def detect_frame(
         self,
         frame: np.ndarray,
@@ -282,11 +332,14 @@ class SoccerDetector:
             timestamp_seconds=timestamp
         )
 
+        # Downscale for faster inference (bboxes scaled back to original res)
+        inference_frame, scale_factor = self._downscale_for_inference(frame)
+
         # Run YOLO detection
         try:
             # Run inference with lower threshold to catch balls
             yolo_results = self.model.predict(
-                frame,
+                inference_frame,
                 conf=min_conf,
                 verbose=False,
                 classes=[self.COCO_PERSON, self.COCO_SPORTS_BALL]  # Only detect persons and sports balls
@@ -296,6 +349,9 @@ class SoccerDetector:
             if SUPERVISION_AVAILABLE:
                 detections = sv.Detections.from_ultralytics(yolo_results)
 
+                # Scale bboxes back to original resolution before tracking
+                detections = self._scale_detections_back(detections, scale_factor)
+
                 # Apply tracking if enabled
                 if track_objects and len(detections) > 0 and self.tracker is not None:
                     detections = self.tracker.update_with_detections(detections)
@@ -303,17 +359,20 @@ class SoccerDetector:
                 # Store raw detections
                 results.raw_detections = detections
 
-                # Parse detections into typed objects
+                # Parse detections into typed objects (uses original-res frame for color)
                 self._parse_yolo_detections(frame, detections, results)
             else:
                 # Fallback without supervision - parse YOLO results directly
+                # Scale bboxes back manually
+                if scale_factor != 1.0 and yolo_results.boxes is not None:
+                    yolo_results.boxes.xyxy *= scale_factor
                 self._parse_yolo_results_direct(frame, yolo_results, results)
 
         except Exception as e:
             logger.error(f"Detection failed on frame {frame_number}: {e}")
             import traceback
             logger.debug(traceback.format_exc())
-        
+
         return results
 
     def _parse_yolo_detections(
@@ -331,35 +390,68 @@ class SoccerDetector:
             tracker_id = int(detections.tracker_id[i]) if detections.tracker_id is not None else None
 
             # Extract dominant color from detection region (for persons)
-            # Use cache if we've already extracted color for this tracked player
+            # Multi-observation cache: store last N colors per tracker_id and
+            # return the median to smooth out lighting variations.
             dominant_color = None
             if class_id == self.COCO_PERSON:
+                # Always extract a fresh color observation
+                fresh_color = self._extract_dominant_color(frame, bbox)
+
                 if tracker_id is not None and tracker_id in self._color_cache:
-                    # Cache hit - reuse previously extracted color (move to end for LRU)
-                    dominant_color = self._color_cache[tracker_id]
+                    # Known tracker - add new observation and return median
                     self._color_cache.move_to_end(tracker_id)
+                    if fresh_color is not None:
+                        self._color_cache[tracker_id].append(fresh_color)
+                    # Compute median color from stored observations
+                    obs = self._color_cache[tracker_id]
+                    if len(obs) > 0:
+                        arr = np.array(list(obs))
+                        dominant_color = tuple(np.median(arr, axis=0).astype(int))
+                    else:
+                        dominant_color = fresh_color
                     self._color_cache_hits += 1
                 else:
-                    # Cache miss - extract color and cache it
-                    dominant_color = self._extract_dominant_color(frame, bbox)
+                    # New tracker or no tracking - start fresh observation list
+                    dominant_color = fresh_color
                     self._color_cache_misses += 1
-                    if tracker_id is not None and dominant_color is not None:
+                    if tracker_id is not None and fresh_color is not None:
                         # LRU eviction - remove oldest if at capacity
                         if len(self._color_cache) >= self._color_cache_max_size:
                             self._color_cache.popitem(last=False)
-                        self._color_cache[tracker_id] = dominant_color
+                        obs_deque = deque(maxlen=self._color_cache_obs_count)
+                        obs_deque.append(fresh_color)
+                        self._color_cache[tracker_id] = obs_deque
 
-            # Handle ball detection
+            # Handle ball detection — collect all candidates, pick best later
             if class_id == self.COCO_SPORTS_BALL:
-                logger.info(f"BALL DETECTED! confidence={confidence:.3f}, bbox={bbox}")
-                ball = BallDetection(
-                    bbox=bbox,
-                    confidence=confidence,
-                    class_id=class_id,
-                    class_name="ball",
-                    tracker_id=tracker_id
-                )
-                results.ball = ball
+                # Size validation: reject implausible detections
+                ball_w = bbox[2] - bbox[0]
+                ball_h = bbox[3] - bbox[1]
+                ball_diameter = max(ball_w, ball_h)
+                frame_h = frame.shape[0]
+
+                # At 1080p from press box, the ball is ~6-30px diameter.
+                # Scale thresholds proportionally for other resolutions.
+                min_ball = max(3, frame_h * 0.004)   # ~4px at 1080p
+                max_ball = frame_h * 0.04             # ~43px at 1080p
+
+                if ball_diameter < min_ball or ball_diameter > max_ball:
+                    logger.debug(f"Ball candidate rejected (size {ball_diameter:.0f}px "
+                                f"outside [{min_ball:.0f}, {max_ball:.0f}])")
+                else:
+                    logger.info(f"BALL CANDIDATE: conf={confidence:.3f}, "
+                               f"bbox={bbox}, size={ball_diameter:.0f}px")
+                    ball = BallDetection(
+                        bbox=bbox,
+                        confidence=confidence,
+                        class_id=class_id,
+                        class_name="ball",
+                        tracker_id=tracker_id
+                    )
+                    # Collect candidates — best-ball selection in _select_best_ball()
+                    if not hasattr(results, '_ball_candidates'):
+                        results._ball_candidates = []
+                    results._ball_candidates.append(ball)
 
             # Handle person detection - classify as player, goalkeeper, or referee
             elif class_id == self.COCO_PERSON:
@@ -399,6 +491,39 @@ class SoccerDetector:
                         dominant_color=dominant_color
                     )
                     results.players.append(player)
+
+        # ---- Best-ball selection from candidates ----
+        candidates = getattr(results, '_ball_candidates', [])
+        if candidates:
+            results.ball = self._select_best_ball(candidates)
+            logger.debug(f"Selected best ball from {len(candidates)} candidates")
+
+    def _select_best_ball(self, candidates: List[BallDetection]) -> BallDetection:
+        """
+        Select the best ball detection from multiple candidates.
+
+        Priority:
+        1. If a Kalman prediction is available (set by EnhancedDetector),
+           pick the candidate closest to the prediction.
+        2. Otherwise, pick the highest-confidence candidate.
+        """
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Check for Kalman prediction (set by EnhancedDetector subclass)
+        kalman_pred = getattr(self, '_kalman_prediction', None)
+        if kalman_pred is not None:
+            pred_x, pred_y = kalman_pred
+            best = min(candidates, key=lambda b: (
+                (b.center[0] - pred_x) ** 2 + (b.center[1] - pred_y) ** 2
+            ))
+            logger.debug(f"Best ball selected by Kalman proximity: "
+                        f"pred=({pred_x:.0f},{pred_y:.0f}), "
+                        f"selected=({best.center[0]:.0f},{best.center[1]:.0f})")
+            return best
+
+        # Fallback: highest confidence
+        return max(candidates, key=lambda b: b.confidence)
 
     def _parse_yolo_results_direct(
         self,
@@ -475,61 +600,131 @@ class SoccerDetector:
         if dominant_color is None:
             return "player"
 
-        # Check if color matches referee colors (use looser threshold of 130)
-        # Yellow referee jerseys often appear as ~(225, 220, 115) due to lighting
+        # LAB distance thresholds (perceptually calibrated):
+        #   ~25 = very close match (same jersey, lighting variation)
+        #   ~40 = reasonable match (kit under variable lighting)
+        #   ~55 = loose match (very different lighting or slight kit variation)
+        GK_THRESHOLD = 40        # Matches goalkeeper kit colors
+        GK_TEAM_MIN_DIST = 35    # GK must be at least this far from team colors
+        REFEREE_THRESHOLD = 40   # Matches referee kit colors
+        REFEREE_VS_TEAM = 10     # Referee must be this much FURTHER from team than team match
+
+        # ---- Step 1: Check goalkeeper colors FIRST ----
+        # GKs wear unique kits — if color matches a GK kit and does NOT match
+        # the corresponding team kit, classify as goalkeeper immediately.
+        for team_id, gk_color in self.goalkeeper_colors.items():
+            gk_distance = self._color_distance(dominant_color, gk_color)
+            logger.debug(f"GK color check: team={team_id}, color={dominant_color}, "
+                        f"gk_color={gk_color}, distance={gk_distance:.1f}")
+            if gk_distance < GK_THRESHOLD:
+                # Verify it doesn't also match a team color (avoid false positives)
+                matches_team = False
+                if hasattr(self, '_team_classifier') and self._team_classifier and self._team_classifier.team_colors is not None:
+                    for team_color in self._team_classifier.team_colors:
+                        team_dist = self._color_distance(dominant_color, tuple(team_color))
+                        if team_dist < gk_distance:
+                            matches_team = True
+                            break
+
+                if not matches_team:
+                    logger.info(f"Classified as GOALKEEPER: team={team_id}, "
+                               f"color={dominant_color}, distance={gk_distance:.1f}")
+                    return "goalkeeper"
+
+        # ---- Step 2: Compute team distances (used by referee check) ----
+        min_team_distance = float('inf')
+        if hasattr(self, '_team_classifier') and self._team_classifier and self._team_classifier.team_colors is not None:
+            for team_color in self._team_classifier.team_colors:
+                dist = self._color_distance(dominant_color, tuple(team_color))
+                min_team_distance = min(min_team_distance, dist)
+
+        # ---- Step 3: Check referee colors AFTER team distance is known ----
+        # A person is only classified as referee if their color is closer to a
+        # referee color than to EITHER team color. This prevents shadow/skin
+        # contaminated players from being misclassified as referees.
         if self.referee_colors:
             for ref_color in self.referee_colors:
-                distance = self._color_distance(dominant_color, ref_color)
-                logger.debug(f"Referee color check: detected={dominant_color}, ref={ref_color}, distance={distance}")
-                if distance < 130:  # Increased to 130 to catch yellows that appear slightly off
-                    logger.info(f"Classified as REFEREE: color={dominant_color}, distance={distance}")
-                    return "referee"
+                ref_distance = self._color_distance(dominant_color, ref_color)
+                logger.debug(f"Referee color check: detected={dominant_color}, "
+                            f"ref={ref_color}, ref_dist={ref_distance:.1f}, "
+                            f"min_team_dist={min_team_distance:.1f}")
+                if ref_distance < REFEREE_THRESHOLD:
+                    # Only classify as referee if the ref color is a BETTER match
+                    # than any team color (prevents player → referee misclassification)
+                    if ref_distance < min_team_distance - REFEREE_VS_TEAM:
+                        logger.info(f"Classified as REFEREE: color={dominant_color}, "
+                                   f"ref_dist={ref_distance:.1f}, team_dist={min_team_distance:.1f}")
+                        return "referee"
+                    else:
+                        logger.debug(f"Ref color matched but team color is closer — keeping as player")
 
-        # Check if color matches goalkeeper colors
-        for team_id, gk_color in self.goalkeeper_colors.items():
-            distance = self._color_distance(dominant_color, gk_color)
-            logger.debug(f"GK color check: team={team_id}, color={dominant_color}, gk_color={gk_color}, distance={distance:.1f}")
-            if distance < 130:  # Increased threshold to match lighting variations
-                logger.info(f"Classified as GOALKEEPER: team={team_id}, color={dominant_color}, distance={distance:.1f}")
-                return "goalkeeper"
-
-        # Position-based heuristic: goalkeepers are often near the edges
+        # ---- Step 4: Position-based GK heuristic (fallback) ----
         if self.field_bounds and dominant_color:
             x1, y1, x2, y2 = bbox
             cx = (x1 + x2) / 2
-            field_x1, _, field_x2, _ = self.field_bounds
+            cy = (y1 + y2) / 2
+            field_x1, field_y1, field_x2, field_y2 = self.field_bounds
             field_width = field_x2 - field_x1
+            field_height = field_y2 - field_y1
 
-            # If person is in the outer 12% of the field width (goal area), might be goalkeeper
-            edge_threshold = field_width * 0.12
-            in_goal_area = cx < field_x1 + edge_threshold or cx > field_x2 - edge_threshold
+            # Horizontal: outer 15% of field width (goal area)
+            edge_threshold = field_width * 0.15
+            in_goal_area_x = cx < field_x1 + edge_threshold or cx > field_x2 - edge_threshold
 
-            if in_goal_area:
-                # Check if color is very different from both team colors
-                # Goalkeepers typically wear distinct colors from their team
-                min_team_distance = float('inf')
+            # Vertical: middle 70% of field height (not on touchline near corner flag)
+            middle_margin = field_height * 0.15
+            in_goal_area_y = cy > field_y1 + middle_margin and cy < field_y2 - middle_margin
 
-                if self.team_colors:
-                    for team_id, team_color in self.team_colors.items():
-                        if team_color:
-                            dist = self._color_distance(dominant_color, team_color)
-                            min_team_distance = min(min_team_distance, dist)
-
-                # If in goal area and color is very different from team colors, likely goalkeeper
-                if min_team_distance > 100:  # Significantly different from team colors
-                    logger.info(f"Classified as GOALKEEPER (position+color): in_goal_area=True, "
+            if in_goal_area_x and in_goal_area_y:
+                # In goal area and color is very different from team colors → goalkeeper
+                if min_team_distance > GK_TEAM_MIN_DIST:
+                    logger.info(f"Classified as GOALKEEPER (position+color): "
                                f"color={dominant_color}, min_team_dist={min_team_distance:.1f}")
                     return "goalkeeper"
 
         return "player"
+
+    @staticmethod
+    def _color_distance_rgb(
+        color1: Tuple[int, int, int],
+        color2: Tuple[int, int, int]
+    ) -> float:
+        """Calculate Euclidean distance between two RGB colors (legacy)"""
+        return np.sqrt(sum((c1 - c2) ** 2 for c1, c2 in zip(color1, color2)))
+
+    @staticmethod
+    def _color_distance_lab(
+        color1: Tuple[int, int, int],
+        color2: Tuple[int, int, int]
+    ) -> float:
+        """
+        Calculate perceptual color distance using CIE LAB color space.
+
+        LAB distance correlates much better with human color perception than RGB.
+        Two colors that look similar to a human will have a small LAB distance,
+        even if their RGB values are far apart (e.g. two different blues under
+        different lighting).
+        """
+        # Convert single-pixel RGB images to LAB
+        c1 = np.array([[color1]], dtype=np.uint8)
+        c2 = np.array([[color2]], dtype=np.uint8)
+        lab1 = cv2.cvtColor(c1, cv2.COLOR_RGB2Lab).astype(np.float32)[0, 0]
+        lab2 = cv2.cvtColor(c2, cv2.COLOR_RGB2Lab).astype(np.float32)[0, 0]
+        return float(np.sqrt(np.sum((lab1 - lab2) ** 2)))
 
     def _color_distance(
         self,
         color1: Tuple[int, int, int],
         color2: Tuple[int, int, int]
     ) -> float:
-        """Calculate Euclidean distance between two RGB colors"""
-        return np.sqrt(sum((c1 - c2) ** 2 for c1, c2 in zip(color1, color2)))
+        """
+        Calculate perceptual color distance (LAB by default).
+
+        Uses CIE LAB for more accurate human-perception-aligned color matching.
+        NOTE: LAB distances are roughly 0-200 range (vs 0-441 for RGB).
+        Thresholds throughout this code are calibrated for LAB distances.
+        """
+        return self._color_distance_lab(color1, color2)
 
     def set_referee_colors(self, colors: List[Tuple[int, int, int]]):
         """Set known referee jersey colors (RGB)"""
@@ -625,17 +820,17 @@ class SoccerDetector:
                 return tuple(mean_color)
 
             # Fast histogram-based dominant color extraction (O(n) vs K-means O(n*k*i))
-            # Quantize colors to 8x8x8 bins (512 bins total) for speed
+            # Quantize colors to 16x16x16 bins (4096 bins total) for better discrimination
             pixels = valid_pixels.astype(np.int32)
 
-            # Quantize each channel to 8 levels (0-255 -> 0-7)
-            quantized = pixels // 32  # 256/32 = 8 levels per channel
+            # Quantize each channel to 16 levels (0-255 -> 0-15)
+            quantized = pixels // 16  # 256/16 = 16 levels per channel
 
-            # Create single index for each color bin: r*64 + g*8 + b
-            bin_indices = quantized[:, 0] * 64 + quantized[:, 1] * 8 + quantized[:, 2]
+            # Create single index for each color bin: r*256 + g*16 + b
+            bin_indices = quantized[:, 0] * 256 + quantized[:, 1] * 16 + quantized[:, 2]
 
             # Count occurrences of each bin
-            bin_counts = np.bincount(bin_indices, minlength=512)
+            bin_counts = np.bincount(bin_indices, minlength=4096)
 
             # Find the most common bin
             dominant_bin = np.argmax(bin_counts)
@@ -697,9 +892,17 @@ class SoccerDetector:
         results_list: List[FrameDetections] = []
 
         try:
+            # Downscale all frames for faster inference
+            inference_frames = []
+            scale_factor = 1.0
+            for f in frames:
+                inf_f, sf = self._downscale_for_inference(f)
+                inference_frames.append(inf_f)
+                scale_factor = sf  # Same for all frames (same resolution)
+
             # Run batch YOLO inference - much more efficient on GPU
             yolo_results_batch = self.model.predict(
-                frames,
+                inference_frames,
                 conf=min_conf,
                 verbose=False,
                 classes=[self.COCO_PERSON, self.COCO_SPORTS_BALL]
@@ -718,13 +921,19 @@ class SoccerDetector:
                 if SUPERVISION_AVAILABLE:
                     detections = sv.Detections.from_ultralytics(yolo_results)
 
+                    # Scale bboxes back to original resolution
+                    detections = self._scale_detections_back(detections, scale_factor)
+
                     # Apply tracking if enabled (must be done sequentially)
                     if track_objects and len(detections) > 0 and self.tracker is not None:
                         detections = self.tracker.update_with_detections(detections)
 
                     frame_detections.raw_detections = detections
+                    # Use original full-res frame for color extraction
                     self._parse_yolo_detections(frame, detections, frame_detections)
                 else:
+                    if scale_factor != 1.0 and yolo_results.boxes is not None:
+                        yolo_results.boxes.xyxy *= scale_factor
                     self._parse_yolo_results_direct(frame, yolo_results, frame_detections)
 
                 results_list.append(frame_detections)
@@ -772,7 +981,13 @@ class SoccerDetector:
 class TeamClassifier:
     """
     Classifies players into teams based on jersey color.
-    Uses K-means clustering on player colors with caching for tracked players.
+
+    Two modes:
+    - **Auto mode** (default): K-Means clustering on collected player colors.
+    - **Locked mode**: When the user manually sets team colors via
+      ``set_team_colors()``, the classifier uses pure LAB-space distance to
+      the two locked centers. This prevents K-Means from drifting due to
+      lighting changes and makes user-specified colors authoritative.
     """
 
     def __init__(self, n_teams: int = 2):
@@ -788,7 +1003,6 @@ class TeamClassifier:
         self.n_teams = n_teams
 
         # Handle sklearn version compatibility
-        # Newer versions (>=1.2) use 'algorithm' parameter differently
         sklearn_version = tuple(map(int, sklearn.__version__.split('.')[:2]))
         if sklearn_version >= (1, 2):
             self.kmeans = KMeans(
@@ -800,47 +1014,68 @@ class TeamClassifier:
         self._is_fitted = False
         self._team_colors = None
 
+        # Locked mode: user-specified colors are authoritative
+        self._locked = False
+        self._locked_colors: Optional[List[Tuple[int, int, int]]] = None
+
         # Team classification cache (tracker_id -> team_id)
-        # Avoids repeated KMeans predictions for tracked players
         self._team_cache: Dict[int, int] = {}
         self._cache_hits = 0
         self._cache_misses = 0
-    
+
     def fit(self, colors: List[Tuple[int, int, int]]):
         """
         Fit the classifier on a collection of jersey colors.
-        
+
+        Only runs K-Means if not in locked mode.
+
         Args:
             colors: List of RGB tuples
         """
+        # In locked mode, ignore auto-fitting — user colors are authoritative
+        if self._locked:
+            logger.debug("Team classifier is locked to user colors — ignoring fit()")
+            return
+
         if len(colors) < self.n_teams:
             logger.warning(f"Not enough colors to classify ({len(colors)} < {self.n_teams})")
             return
-        
+
         color_array = np.array(colors)
         self.kmeans.fit(color_array)
         self._team_colors = self.kmeans.cluster_centers_.astype(int)
         self._is_fitted = True
-        
+
         logger.info(f"Team classifier fitted with colors: {self._team_colors}")
-    
+
     def classify(self, color: Tuple[int, int, int]) -> int:
         """
         Classify a single color to a team.
-        
+
+        In locked mode, uses LAB distance to locked centers.
+        In auto mode, uses K-Means prediction.
+
         Args:
             color: RGB tuple
-            
+
         Returns:
             Team ID (0 or 1)
         """
+        if self._locked and self._locked_colors:
+            # Locked mode — pure LAB distance to user-specified team colors
+            distances = [
+                SoccerDetector._color_distance_lab(color, tc)
+                for tc in self._locked_colors
+            ]
+            return int(np.argmin(distances))
+
         if not self._is_fitted:
             return -1
-        
+
         color_array = np.array([color])
         team_id = self.kmeans.predict(color_array)[0]
         return int(team_id)
-    
+
     def classify_players(self, players: List[PlayerDetection]) -> List[PlayerDetection]:
         """
         Classify all players in a list, using cache for tracked players.
@@ -864,36 +1099,55 @@ class TeamClassifier:
                     self._team_cache[player.tracker_id] = player.team_id
 
         return players
-    
+
     @property
     def team_colors(self) -> Optional[np.ndarray]:
-        """Get the learned team colors"""
+        """Get the current team colors (locked or learned)"""
         return self._team_colors
-    
+
+    @property
+    def is_locked(self) -> bool:
+        """Whether team colors are locked to user-specified values"""
+        return self._locked
+
     def set_team_colors(
         self,
         home_color: Tuple[int, int, int],
         away_color: Tuple[int, int, int]
     ):
         """
-        Manually set team colors instead of learning them.
+        Manually set team colors and lock the classifier.
+
+        In locked mode, classify() uses LAB distance to these exact colors
+        instead of K-Means prediction. This prevents cluster drift and makes
+        user-specified colors authoritative.
 
         Args:
             home_color: RGB tuple for home team
             away_color: RGB tuple for away team
         """
         self._team_colors = np.array([home_color, away_color])
-        # Create fake data with exactly the team colors to properly fit the KMeans
-        # This ensures all internal attributes (_n_threads, etc.) are properly initialized
+        self._locked = True
+        self._locked_colors = [home_color, away_color]
+
+        # Still fit KMeans so that code expecting fitted state doesn't break,
+        # but classify() will bypass it when locked.
         fake_data = np.array([home_color, away_color], dtype=np.float64)
         self.kmeans.fit(fake_data)
-        # Override cluster centers with exact colors
         self.kmeans.cluster_centers_ = self._team_colors.astype(np.float64)
         self._is_fitted = True
+
         # Clear cache when team colors change
         self._team_cache.clear()
 
-        logger.info(f"Team colors manually set: Home={home_color}, Away={away_color}")
+        logger.info(f"Team colors LOCKED: Home={home_color}, Away={away_color}")
+
+    def unlock(self):
+        """Unlock the classifier to allow auto-fitting via K-Means again."""
+        self._locked = False
+        self._locked_colors = None
+        self._team_cache.clear()
+        logger.info("Team classifier unlocked — will auto-fit on next fit() call")
 
     def reset_cache(self):
         """Reset the team classification cache (call between videos)"""
@@ -1095,11 +1349,12 @@ def draw_detections(
     team_colors: Optional[Dict[int, Tuple[int, int, int]]] = None,
     draw_ball: bool = True,
     draw_referees: bool = True,
-    draw_labels: bool = True
+    draw_labels: bool = True,
+    simplified: Optional[bool] = None
 ) -> np.ndarray:
     """
     Draw detection boxes and labels on a frame.
-    
+
     Args:
         frame: BGR image
         detections: FrameDetections object
@@ -1107,12 +1362,17 @@ def draw_detections(
         draw_ball: Whether to draw ball
         draw_referees: Whether to draw referees
         draw_labels: Whether to draw text labels
-        
+        simplified: Use dots instead of rectangles+text for faster rendering.
+                    If None, reads from settings.simplified_annotations.
+
     Returns:
         Annotated frame
     """
     annotated = frame.copy()
-    
+
+    # Determine whether to use simplified annotations
+    use_simplified = simplified if simplified is not None else settings.simplified_annotations
+
     # Default colors (BGR)
     default_colors = {
         0: (0, 255, 255),   # Home - Yellow
@@ -1120,25 +1380,54 @@ def draw_detections(
         -1: (128, 128, 128) # Unknown - Gray
     }
     team_colors = team_colors or default_colors
-    
+
     ball_color = (0, 165, 255)      # Orange
     referee_color = (50, 50, 50)    # Dark gray
     goalkeeper_color = (0, 255, 0)  # Green
-    
+
+    if use_simplified:
+        # Fast path: colored dots at feet (bottom-center of bbox) — no text, no rectangles
+        for player in detections.players:
+            color = team_colors.get(player.team_id, team_colors.get(-1, (128, 128, 128)))
+            x1, y1, x2, y2 = map(int, player.bbox)
+            cx = (x1 + x2) // 2
+            cv2.circle(annotated, (cx, y2), 8, color, -1)
+            cv2.circle(annotated, (cx, y2), 9, (255, 255, 255), 1)
+
+        for gk in detections.goalkeepers:
+            x1, y1, x2, y2 = map(int, gk.bbox)
+            cx = (x1 + x2) // 2
+            cv2.circle(annotated, (cx, y2), 10, goalkeeper_color, -1)
+            cv2.circle(annotated, (cx, y2), 11, (255, 255, 255), 2)
+
+        if draw_referees:
+            for ref in detections.referees:
+                x1, y1, x2, y2 = map(int, ref.bbox)
+                cx = (x1 + x2) // 2
+                cv2.circle(annotated, (cx, y2), 6, referee_color, -1)
+
+        if draw_ball and detections.ball:
+            cx, cy = detections.ball.center
+            cv2.circle(annotated, (int(cx), int(cy)), 12, ball_color, -1)
+            cv2.circle(annotated, (int(cx), int(cy)), 14, (255, 255, 255), 2)
+
+        return annotated
+
+    # Full annotation path: rectangles + labels
     # Draw players
     for player in detections.players:
-        color = team_colors.get(player.team_id, team_colors[-1])
+        color = team_colors.get(player.team_id, team_colors.get(-1, (128, 128, 128)))
         _draw_detection_box(annotated, player, color, draw_labels)
-    
+
     # Draw goalkeepers
     for gk in detections.goalkeepers:
         _draw_detection_box(annotated, gk, goalkeeper_color, draw_labels, prefix="GK")
-    
+
     # Draw referees
     if draw_referees:
         for ref in detections.referees:
             _draw_detection_box(annotated, ref, referee_color, draw_labels, prefix="REF")
-    
+
     # Draw ball
     if draw_ball:
         if detections.ball:
